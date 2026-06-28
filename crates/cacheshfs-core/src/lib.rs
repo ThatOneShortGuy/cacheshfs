@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod vfs;
+
+pub use vfs::CacheVfs;
+
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub remote: RemoteConfig,
@@ -227,6 +231,27 @@ impl RemotePath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Append a single path component to this path, returning the child path.
+    ///
+    /// `name` must be a single component: empty names, `.`/`..`, and names
+    /// containing a path separator are rejected so callers cannot escape the
+    /// remote root through crafted lookup names.
+    pub fn join(&self, name: &str) -> Result<RemotePath> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(Error::InvalidInput(format!(
+                "'{name}' is not a valid path component"
+            )));
+        }
+
+        let base = self.0.trim_end_matches('/');
+        RemotePath::new(format!("{base}/{name}"))
     }
 }
 
