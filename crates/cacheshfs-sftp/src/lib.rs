@@ -17,7 +17,9 @@ use cacheshfs_core::{
     SetAttributes,
 };
 use russh::client::{self, Handle};
-use russh::keys::{PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key};
+use russh::keys::agent::AgentIdentity;
+use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes as SftpAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -346,6 +348,12 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, options: &SftpConnectO
         .flatten()
         .flatten();
 
+    // Prefer the SSH agent (lets passphrase-protected keys be used without the
+    // passphrase on the command line), then fall back to identity files.
+    if options.use_agent && try_agent_auth(handle, &options.target.username, rsa_hash).await {
+        return Ok(());
+    }
+
     for identity_file in &options.identity_files {
         if !identity_file.exists() {
             continue;
@@ -364,6 +372,98 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, options: &SftpConnectO
     }
 
     Err(Error::PermissionDenied)
+}
+
+/// Connect to the platform's SSH agent and try to authenticate with each of its
+/// identities. Returns `true` on success, `false` if no agent is reachable or no
+/// identity authenticated.
+#[cfg(unix)]
+async fn try_agent_auth(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    rsa_hash: Option<HashAlg>,
+) -> bool {
+    match AgentClient::connect_env().await {
+        Ok(agent) => authenticate_with_agent(handle, user, rsa_hash, agent).await,
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+async fn try_agent_auth(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    rsa_hash: Option<HashAlg>,
+) -> bool {
+    // Try named-pipe agents in order: an explicit `SSH_AUTH_SOCK` (if set), then
+    // the default Windows OpenSSH agent pipe — so a stray/foreign `SSH_AUTH_SOCK`
+    // can't hide the real service. Finally fall back to Pageant.
+    let mut pipes: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+        pipes.push(sock);
+    }
+    pipes.push(std::ffi::OsString::from(r"\\.\pipe\openssh-ssh-agent"));
+
+    for pipe in pipes {
+        if let Ok(agent) = AgentClient::connect_named_pipe(&pipe).await
+            && authenticate_with_agent(handle, user, rsa_hash, agent).await
+        {
+            return true;
+        }
+    }
+
+    match AgentClient::connect_pageant().await {
+        Ok(agent) => authenticate_with_agent(handle, user, rsa_hash, agent).await,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn try_agent_auth(
+    _handle: &mut Handle<ClientHandler>,
+    _user: &str,
+    _rsa_hash: Option<HashAlg>,
+) -> bool {
+    false
+}
+
+/// Try every identity offered by `agent` against the server, signing through the
+/// agent (the private key never leaves it). Generic over the agent's transport
+/// so concrete stream types satisfy the `Signer` bounds without type erasure.
+async fn authenticate_with_agent<S>(
+    handle: &mut Handle<ClientHandler>,
+    user: &str,
+    rsa_hash: Option<HashAlg>,
+    mut agent: AgentClient<S>,
+) -> bool
+where
+    S: AgentStream + Unpin + Send,
+{
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(_) => return false,
+    };
+
+    for identity in identities {
+        let AgentIdentity::PublicKey { key, .. } = identity else {
+            // Certificates aren't handled here.
+            continue;
+        };
+        let hash_alg = if key.algorithm().is_rsa() {
+            rsa_hash
+        } else {
+            None
+        };
+        if let Ok(result) = handle
+            .authenticate_publickey_with(user, key, hash_alg, &mut agent)
+            .await
+            && result.success()
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn default_username() -> Result<String> {
