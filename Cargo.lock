@@ -105,6 +105,7 @@ version = "0.1.0"
 dependencies = [
  "cacheshfs-core",
  "cacheshfs-linux",
+ "cacheshfs-sftp",
  "cacheshfs-windows",
  "clap",
  "winfsp",

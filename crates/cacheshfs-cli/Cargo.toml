@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cacheshfs-core.workspace = true
+cacheshfs-sftp.workspace = true
 clap.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

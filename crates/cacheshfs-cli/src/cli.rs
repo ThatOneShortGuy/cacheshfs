@@ -4,6 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use cacheshfs_core::{CacheMode, MountConfig, RemoteConfig};
+use cacheshfs_sftp::{SftpConnectOptions, SftpTarget};
 use clap::{Parser, ValueEnum};
 
 /// Mount a remote directory over SSH with an optional local cache.
@@ -44,6 +45,11 @@ pub struct Cli {
     /// Private key file.
     #[arg(long, value_name = "PATH")]
     pub identity_file: Option<PathBuf>,
+
+    /// Connect even if the host key is not present in known_hosts. Insecure:
+    /// this disables host-key verification for unknown hosts.
+    #[arg(long)]
+    pub accept_unknown_host_key: bool,
 
     /// SSH config file.
     #[arg(long, value_name = "PATH")]
@@ -93,12 +99,6 @@ impl Cli {
     /// ignore them.
     pub fn unwired_options(&self) -> Vec<&'static str> {
         let mut names = Vec::new();
-        if self.port.is_some() {
-            names.push("--port");
-        }
-        if self.identity_file.is_some() {
-            names.push("--identity-file");
-        }
         if self.ssh_config.is_some() {
             names.push("--ssh-config");
         }
@@ -143,6 +143,25 @@ impl Cli {
             cache_mode: self.cache_mode.into(),
             read_only: self.read_only,
         })
+    }
+
+    /// Build the SFTP connection options for `target` (the `[user@]host` part of
+    /// the remote spec), applying the `--port`, `--identity-file`, and
+    /// `--accept-unknown-host-key` flags on top of the transport defaults.
+    pub fn connect_options(&self, target: &str) -> Result<SftpConnectOptions, String> {
+        let mut sftp_target = SftpTarget::parse(target).map_err(|error| error.to_string())?;
+        if let Some(port) = self.port {
+            sftp_target.port = port;
+        }
+
+        let mut options = SftpConnectOptions::for_target(sftp_target);
+        if let Some(identity_file) = &self.identity_file {
+            options = options.with_identity_file(identity_file.clone());
+        }
+        if self.accept_unknown_host_key {
+            options = options.accept_unknown_hosts(true);
+        }
+        Ok(options)
     }
 }
 
@@ -258,6 +277,7 @@ mod tests {
             read_only: false,
             port: None,
             identity_file: None,
+            accept_unknown_host_key: false,
             ssh_config: None,
             metadata_ttl: None,
             content_ttl: None,
@@ -277,6 +297,7 @@ mod tests {
             read_only: true,
             port: None,
             identity_file: None,
+            accept_unknown_host_key: false,
             ssh_config: None,
             metadata_ttl: None,
             content_ttl: None,
@@ -385,11 +406,63 @@ mod parse_tests {
         assert!(bare.unwired_options().is_empty());
 
         let with_extras =
-            parse(&["cacheshfs", "host:/srv", "/mnt", "--port", "22", "--allow-other"]).unwrap();
+            parse(&["cacheshfs", "host:/srv", "/mnt", "--ssh-config", "/c", "--allow-other"])
+                .unwrap();
         let reported = with_extras.unwired_options();
-        assert!(reported.contains(&"--port"));
+        assert!(reported.contains(&"--ssh-config"));
         assert!(reported.contains(&"--allow-other"));
-        assert!(!reported.contains(&"--ssh-config"));
+        // --port and --identity-file are now wired into the SFTP connection.
+        assert!(!reported.contains(&"--port"));
+        assert!(!reported.contains(&"--identity-file"));
+    }
+
+    #[test]
+    fn port_and_identity_are_not_reported_as_unwired() {
+        let cli = parse(&[
+            "cacheshfs",
+            "host:/srv",
+            "/mnt",
+            "--port",
+            "2222",
+            "--identity-file",
+            "/k/id",
+        ])
+        .unwrap();
+        assert!(cli.unwired_options().is_empty());
+    }
+
+    #[test]
+    fn connect_options_apply_port_and_identity() {
+        let cli = parse(&[
+            "cacheshfs",
+            "alice@host:/srv",
+            "/mnt",
+            "--port",
+            "2222",
+            "--identity-file",
+            "/keys/id_ed25519",
+        ])
+        .unwrap();
+        let options = cli.connect_options("alice@host").unwrap();
+        assert_eq!(options.target.username, "alice");
+        assert_eq!(options.target.host, "host");
+        assert_eq!(options.target.port, 2222);
+        assert!(options.identity_files.contains(&PathBuf::from("/keys/id_ed25519")));
+        // Secure default: unknown host keys are rejected unless opted in.
+        assert!(!options.accept_unknown_hosts);
+    }
+
+    #[test]
+    fn connect_options_accept_unknown_host_key() {
+        let cli = parse(&[
+            "cacheshfs",
+            "alice@host:/srv",
+            "/mnt",
+            "--accept-unknown-host-key",
+        ])
+        .unwrap();
+        let options = cli.connect_options("alice@host").unwrap();
+        assert!(options.accept_unknown_hosts);
     }
 
     #[test]
