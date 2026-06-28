@@ -16,7 +16,11 @@ Implement `RemoteFilesystem` here. This crate should expose remote files through
   `user@[ipv6]:port` forms.
 - Verifies host keys against OpenSSH `known_hosts` files by default; rejects
   unknown or mismatched keys unless `SftpConnectOptions::accept_unknown_hosts(true)`.
-- Authenticates with private key files from `SftpConnectOptions::identity_files`
+- Authenticates against the SSH agent first when `use_agent` is set (the
+  Unix `SSH_AUTH_SOCK` socket, or the Windows OpenSSH named pipe / Pageant), so
+  keys never leave the agent and passphrase-protected keys work without a
+  passphrase on the command line.
+- Falls back to private key files from `SftpConnectOptions::identity_files`
   (defaults to standard `~/.ssh` key names), including ed25519.
 - Implements `stat`, `read_dir`, `read`, `write`, `create`, `mkdir`, `unlink`,
   `rmdir`, `rename`, and `setattr` through SFTP.
@@ -24,8 +28,6 @@ Implement `RemoteFilesystem` here. This crate should expose remote files through
 
 ## Next Transport Work
 
-- SSH-agent authentication (`use_agent`) is not yet wired in the russh port;
-  authentication currently uses identity files only.
 - Add tests against a disposable SSH/SFTP server.
 - Decide whether Windows client paths need additional handling before passing
   SFTP paths through the server.
