@@ -1,0 +1,13 @@
+[package]
+name = "cacheshfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cacheshfs-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cacheshfs-linux.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cacheshfs-windows.workspace = true

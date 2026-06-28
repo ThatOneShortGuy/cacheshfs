@@ -1,6 +1,21 @@
-[package]
-name = "cacheshfs"
+[workspace]
+members = [
+    "crates/cacheshfs-cli",
+    "crates/cacheshfs-core",
+    "crates/cacheshfs-linux",
+    "crates/cacheshfs-sftp",
+    "crates/cacheshfs-windows",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+cacheshfs-core = { path = "crates/cacheshfs-core" }
+cacheshfs-linux = { path = "crates/cacheshfs-linux" }
+cacheshfs-sftp = { path = "crates/cacheshfs-sftp" }
+cacheshfs-windows = { path = "crates/cacheshfs-windows" }
+fuser = "0.17.0"
+tokio = { version = "1.52.3", features = ["fs"] }

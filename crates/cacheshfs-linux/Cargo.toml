@@ -1,0 +1,8 @@
+[package]
+name = "cacheshfs-linux"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cacheshfs-core.workspace = true
+fuser.workspace = true

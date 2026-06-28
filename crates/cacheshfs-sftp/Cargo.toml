@@ -1,0 +1,7 @@
+[package]
+name = "cacheshfs-sftp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cacheshfs-core.workspace = true
