@@ -16,9 +16,12 @@ cacheshfs [OPTIONS] [user@]host:/remote/path <mountpoint>
 - `--port`, `--identity-file`, `--accept-unknown-host-key` → SFTP connection
   (`SftpConnectOptions`)
 
-`--accept-unknown-host-key` is insecure: it disables host-key verification for
-hosts absent from `known_hosts`. Without it, connecting to an unknown host
-fails, matching strict host-key checking.
+By default, connecting to a host absent from `known_hosts` shows an OpenSSH-style
+trust-on-first-use prompt (displays the key fingerprint; on `yes` the key is
+recorded so later connections verify silently). A *changed* host key is always
+rejected. With no terminal available the connection is refused rather than
+hanging. `--accept-unknown-host-key` skips the prompt and blindly trusts unknown
+hosts (insecure).
 
 ## Accepted but not yet applied
 

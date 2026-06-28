@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cacheshfs_core::{
@@ -19,6 +19,7 @@ use cacheshfs_core::{
 use russh::client::{self, Handle};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::known_hosts::{learn_known_hosts, learn_known_hosts_path};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes as SftpAttributes, FileType, OpenFlags, StatusCode};
@@ -272,6 +273,32 @@ struct ClientHandler {
     port: u16,
 }
 
+/// Result of looking a server's host key up in `known_hosts`.
+enum HostKeyStatus {
+    /// The key is recorded and matches.
+    Known,
+    /// The host is recorded with a *different* key (possible MITM) — reject.
+    Changed,
+    /// The host isn't recorded yet.
+    Unknown,
+}
+
+impl ClientHandler {
+    fn classify_host_key(&self, key: &PublicKey) -> HostKeyStatus {
+        for path in &self.known_hosts_files {
+            if !path.exists() {
+                continue;
+            }
+            match check_known_hosts_path(&self.host, self.port, key, path) {
+                Ok(true) => return HostKeyStatus::Known,
+                Ok(false) => continue,
+                Err(_) => return HostKeyStatus::Changed,
+            }
+        }
+        HostKeyStatus::Unknown
+    }
+}
+
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -279,28 +306,108 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> impl Future<Output = std::result::Result<bool, Self::Error>> + Send {
-        // Decide synchronously, then hand back a ready future (no awaits here).
-        let mut accepted = self.accept_unknown_hosts;
-        for path in &self.known_hosts_files {
-            if !path.exists() {
-                continue;
-            }
-            match check_known_hosts_path(&self.host, self.port, server_public_key, path) {
-                Ok(true) => {
-                    accepted = true;
-                    break;
-                }
-                // Host not present in this file: keep looking.
-                Ok(false) => continue,
-                // Changed/conflicting key or unreadable file: reject.
-                Err(_) => {
-                    accepted = false;
-                    break;
+        let status = self.classify_host_key(server_public_key);
+        let accept_unknown = self.accept_unknown_hosts;
+        let host = self.host.clone();
+        let port = self.port;
+        // Record into the first configured known_hosts file (the user's
+        // ~/.ssh/known_hosts by default).
+        let known_hosts_path = self.known_hosts_files.first().cloned();
+        let key = server_public_key.clone();
+        let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
+        let key_type = server_public_key.algorithm().as_str().to_string();
+
+        async move {
+            match status {
+                HostKeyStatus::Known => Ok(true),
+                HostKeyStatus::Changed => Ok(false),
+                HostKeyStatus::Unknown => {
+                    // Blind opt-in skips the prompt entirely.
+                    if accept_unknown {
+                        return Ok(true);
+                    }
+                    // Prompt off the async worker so the blocking stdin read
+                    // doesn't stall the runtime.
+                    let decision = tokio::task::spawn_blocking(move || {
+                        prompt_unknown_host(
+                            &host,
+                            port,
+                            &key,
+                            &fingerprint,
+                            &key_type,
+                            known_hosts_path.as_deref(),
+                        )
+                    })
+                    .await
+                    .unwrap_or(false);
+                    Ok(decision)
                 }
             }
         }
-        async move { Ok(accepted) }
     }
+}
+
+/// Trust-on-first-use prompt for an unknown host key, mirroring the OpenSSH
+/// client. Only prompts when stdin is a terminal; otherwise refuses (safe for
+/// non-interactive/daemon use). On acceptance the key is recorded in
+/// `known_hosts` so later connections verify silently.
+///
+/// This console interaction lives in the transport for now; a future refactor
+/// could inject the policy as a callback so the CLI owns the UI.
+fn prompt_unknown_host(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    fingerprint: &str,
+    key_type: &str,
+    known_hosts_path: Option<&Path>,
+) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "cacheshfs: host '{host}' is not in known_hosts and no terminal is available to \
+             confirm its key ({key_type} {fingerprint}); refusing. Pass \
+             --accept-unknown-host-key to connect without verification."
+        );
+        return false;
+    }
+
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(
+        stderr,
+        "The authenticity of host '{host}' can't be established.\n\
+         {key_type} key fingerprint is {fingerprint}."
+    );
+    let _ = write!(
+        stderr,
+        "Are you sure you want to continue connecting (yes/no)? "
+    );
+    let _ = stderr.flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return false;
+    }
+    if !answer.trim().eq_ignore_ascii_case("yes") {
+        eprintln!("Host key verification declined.");
+        return false;
+    }
+
+    // Approved: record the key so future connects verify without a prompt.
+    let recorded = match known_hosts_path {
+        Some(path) => learn_known_hosts_path(host, port, key, path),
+        None => learn_known_hosts(host, port, key),
+    };
+    match recorded {
+        Ok(()) => eprintln!(
+            "Warning: Permanently added '{host}' ({key_type}) to the list of known hosts."
+        ),
+        Err(error) => {
+            eprintln!("cacheshfs: warning: could not record host key in known_hosts: {error}")
+        }
+    }
+    true
 }
 
 async fn connect_async(

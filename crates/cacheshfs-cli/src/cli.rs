@@ -46,8 +46,9 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub identity_file: Option<PathBuf>,
 
-    /// Connect even if the host key is not present in known_hosts. Insecure:
-    /// this disables host-key verification for unknown hosts.
+    /// Blindly trust an unknown host key without the interactive prompt.
+    /// Insecure: skips trust-on-first-use confirmation. By default an unknown
+    /// host prompts for confirmation (and a changed key is always rejected).
     #[arg(long)]
     pub accept_unknown_host_key: bool,
 

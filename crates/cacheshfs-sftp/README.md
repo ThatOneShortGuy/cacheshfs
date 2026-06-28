@@ -14,8 +14,16 @@ Implement `RemoteFilesystem` here. This crate should expose remote files through
   One SSH connection multiplexes concurrent SFTP requests (no global lock).
 - Accepts targets in `user@host`, `user@host:port`, `host`, `host:port`, and
   `user@[ipv6]:port` forms.
-- Verifies host keys against OpenSSH `known_hosts` files by default; rejects
-  unknown or mismatched keys unless `SftpConnectOptions::accept_unknown_hosts(true)`.
+- Verifies host keys against OpenSSH `known_hosts` files:
+  - a recorded, matching key connects silently;
+  - a *changed* key is always rejected (possible MITM);
+  - an *unknown* host triggers an OpenSSH-style trust-on-first-use prompt (shows
+    the SHA256 fingerprint, and on `yes` records the key to `known_hosts` so
+    later connections verify silently). With no terminal available the
+    connection is refused instead of hanging.
+  - `SftpConnectOptions::accept_unknown_hosts(true)` (CLI
+    `--accept-unknown-host-key`) skips the prompt and blindly trusts unknown
+    hosts.
 - Authenticates against the SSH agent first when `use_agent` is set (the
   Unix `SSH_AUTH_SOCK` socket, or the Windows OpenSSH named pipe / Pageant), so
   keys never leave the agent and passphrase-protected keys work without a
