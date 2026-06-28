@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 cacheshfs-core.workspace = true
 fuser.workspace = true
+libc.workspace = true
