@@ -5,9 +5,17 @@ edition.workspace = true
 
 [dependencies]
 cacheshfs-core.workspace = true
+clap.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cacheshfs-linux.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cacheshfs-windows.workspace = true
+
+# WinFsp links only via delay-loading. `rustc-link-arg` does not propagate from
+# cacheshfs-windows to this binary, so the final binary crate must emit the
+# `/DELAYLOAD` flag itself (see build.rs); otherwise the executable fails to
+# start with STATUS_DLL_NOT_FOUND.
+[target.'cfg(windows)'.build-dependencies]
+winfsp = "0.13"
