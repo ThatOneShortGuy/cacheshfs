@@ -6,17 +6,26 @@ Implement `RemoteFilesystem` here. This crate should expose remote files through
 
 ## Current Behavior
 
-- Uses the blocking `ssh2` crate.
-- Accepts targets in `user@host`, `user@host:port`, `host`, `host:port`, and `user@[ipv6]:port` forms.
-- Verifies host keys against OpenSSH `known_hosts` files by default.
-- Rejects unknown or mismatched host keys unless `SftpConnectOptions::accept_unknown_hosts(true)` is set explicitly.
-- Uses the local SSH agent for authentication first.
-- Falls back to private key files from standard `~/.ssh` key names.
-- Implements `stat`, `read_dir`, `read`, `write`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`, and `setattr` through SFTP.
-- Maps common SFTP errors into `cacheshfs_core::Error`.
+- Built on the pure-Rust `russh` / `russh-sftp` stack with the `ring` crypto
+  backend — no OpenSSL/WinCNG C dependency, so modern key types (notably
+  ed25519) work on every platform, including Windows.
+- Exposes a synchronous `RemoteFilesystem`. Async is internal: an embedded
+  multi-threaded Tokio runtime drives russh, and the sync methods `block_on`.
+  One SSH connection multiplexes concurrent SFTP requests (no global lock).
+- Accepts targets in `user@host`, `user@host:port`, `host`, `host:port`, and
+  `user@[ipv6]:port` forms.
+- Verifies host keys against OpenSSH `known_hosts` files by default; rejects
+  unknown or mismatched keys unless `SftpConnectOptions::accept_unknown_hosts(true)`.
+- Authenticates with private key files from `SftpConnectOptions::identity_files`
+  (defaults to standard `~/.ssh` key names), including ed25519.
+- Implements `stat`, `read_dir`, `read`, `write`, `create`, `mkdir`, `unlink`,
+  `rmdir`, `rename`, and `setattr` through SFTP.
+- Maps SFTP/SSH errors into `cacheshfs_core::Error`.
 
 ## Next Transport Work
 
+- SSH-agent authentication (`use_agent`) is not yet wired in the russh port;
+  authentication currently uses identity files only.
 - Add tests against a disposable SSH/SFTP server.
-- Add configurable host-key file paths and identity paths from the CLI once CLI parsing exists.
-- Decide whether Windows client paths need additional handling before passing SFTP paths through `std::path::Path`.
+- Decide whether Windows client paths need additional handling before passing
+  SFTP paths through the server.

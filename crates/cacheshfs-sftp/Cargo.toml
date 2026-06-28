@@ -5,4 +5,20 @@ edition.workspace = true
 
 [dependencies]
 cacheshfs-core.workspace = true
-ssh2.workspace = true
+# Use russh's pure-Rust `ring` crypto backend instead of the default
+# `aws-lc-rs`, which requires NASM to build on Windows. `ring` ships prebuilt
+# assembly for windows-msvc, so the crate builds with no extra C/asm toolchain.
+russh = { version = "0.61.2", default-features = false, features = [
+    "ring",
+    "flate2",
+    "rsa",
+] }
+russh-sftp = "2.3.0"
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }

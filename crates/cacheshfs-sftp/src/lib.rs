@@ -1,22 +1,34 @@
+//! SSH/SFTP transport implementing [`cacheshfs_core::RemoteFilesystem`].
+//!
+//! Built on the pure-Rust [`russh`]/[`russh_sftp`] stack (no OpenSSL/WinCNG C
+//! crypto backend), so modern key types — notably ed25519 — work consistently
+//! on every platform. The crate exposes a synchronous `RemoteFilesystem`; async
+//! is confined here, driven by an embedded multi-threaded Tokio runtime that the
+//! synchronous methods `block_on`. A single SSH connection multiplexes
+//! concurrent SFTP requests, so the previous global SFTP mutex is gone.
+
+use std::future::Future;
+use std::io::SeekFrom;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use cacheshfs_core::{
     Error, FileAttributes, FileKind, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result,
     SetAttributes,
 };
-use ssh2::{
-    CheckResult, FileStat, KnownHostFileKind, OpenFlags as SftpOpenFlags, OpenType, Session, Sftp,
-};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-const S_IFMT: u32 = 0o170000;
-const S_IFDIR: u32 = 0o040000;
-const S_IFLNK: u32 = 0o120000;
+use russh::client::{self, Handle};
+use russh::keys::{PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key};
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes as SftpAttributes, FileType, OpenFlags, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::runtime::Runtime;
 
 pub struct SftpBackend {
-    _session: Session,
-    sftp: Mutex<Sftp>,
+    // Kept alive to hold the SSH connection open; field-drop order is
+    // declaration order, so the runtime (last) outlives the session/handle.
+    _handle: Handle<ClientHandler>,
+    sftp: SftpSession,
+    runtime: Runtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +43,8 @@ pub struct SftpConnectOptions {
     pub target: SftpTarget,
     pub known_hosts_files: Vec<PathBuf>,
     pub accept_unknown_hosts: bool,
+    /// Reserved: SSH-agent auth is not yet wired in the russh transport, which
+    /// authenticates with identity files. Kept for API/source compatibility.
     pub use_agent: bool,
     pub identity_files: Vec<PathBuf>,
     pub passphrase: Option<String>,
@@ -46,37 +60,20 @@ impl SftpBackend {
     }
 
     pub fn connect_with_options(options: SftpConnectOptions) -> Result<Self> {
-        let tcp = TcpStream::connect((options.target.host.as_str(), options.target.port)).map_err(
-            |error| {
-                Error::Unavailable(format!(
-                    "failed to connect to {}:{}: {error}",
-                    options.target.host, options.target.port
-                ))
-            },
-        )?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                Error::Unavailable(format!("failed to start ssh transport runtime: {error}"))
+            })?;
 
-        let mut session = Session::new().map_err(map_ssh_error)?;
-        session.set_tcp_stream(tcp);
-        session.handshake().map_err(map_ssh_error)?;
-
-        verify_host_key(&session, &options)?;
-        authenticate(&session, &options)?;
-
-        let sftp = session.sftp().map_err(map_ssh_error)?;
+        let (handle, sftp) = runtime.block_on(connect_async(&options))?;
 
         Ok(Self {
-            _session: session,
-            sftp: Mutex::new(sftp),
+            _handle: handle,
+            sftp,
+            runtime,
         })
-    }
-
-    fn with_sftp<T>(&self, operation: impl FnOnce(&Sftp) -> Result<T>) -> Result<T> {
-        let sftp = self
-            .sftp
-            .lock()
-            .map_err(|_| Error::RemoteBackend("sftp client lock was poisoned".to_string()))?;
-
-        operation(&sftp)
     }
 }
 
@@ -134,102 +131,239 @@ impl SftpConnectOptions {
 
 impl RemoteFilesystem for SftpBackend {
     fn stat(&self, path: &RemotePath) -> Result<FileAttributes> {
-        self.with_sftp(|sftp| {
-            let stat = sftp.stat(to_path(path)).map_err(map_ssh_error)?;
-            file_attributes(stat)
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            let metadata = self.sftp.metadata(path).await.map_err(map_sftp_error)?;
+            Ok(file_attributes(&metadata))
         })
     }
 
     fn read_dir(&self, path: &RemotePath) -> Result<Vec<RemoteDirectoryEntry>> {
-        self.with_sftp(|sftp| {
-            sftp.readdir(to_path(path))
-                .map_err(map_ssh_error)?
-                .into_iter()
-                .map(|(path, stat)| {
-                    Ok(RemoteDirectoryEntry {
-                        name: file_name(path)?,
-                        attributes: file_attributes(stat)?,
-                    })
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            let entries = self.sftp.read_dir(path).await.map_err(map_sftp_error)?;
+            Ok(entries
+                .map(|entry| RemoteDirectoryEntry {
+                    name: entry.file_name(),
+                    attributes: file_attributes(&entry.metadata()),
                 })
-                .collect()
+                .collect())
         })
     }
 
     fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
-        self.with_sftp(|sftp| {
-            let mut file = sftp.open(to_path(path)).map_err(map_ssh_error)?;
-            file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            let mut file = self.sftp.open(path).await.map_err(map_sftp_error)?;
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(map_io_error)?;
 
-            let mut buffer = vec![0; size as usize];
-            let bytes_read = file.read(&mut buffer).map_err(map_io_error)?;
-            buffer.truncate(bytes_read);
-
+            let mut buffer = vec![0u8; size as usize];
+            let mut filled = 0;
+            while filled < buffer.len() {
+                let read = file.read(&mut buffer[filled..]).await.map_err(map_io_error)?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            buffer.truncate(filled);
             Ok(buffer)
         })
     }
 
     fn write(&self, path: &RemotePath, offset: u64, data: &[u8]) -> Result<u32> {
-        self.with_sftp(|sftp| {
-            let mut file = sftp
-                .open_mode(to_path(path), SftpOpenFlags::WRITE, 0, OpenType::File)
-                .map_err(map_ssh_error)?;
-            file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
-            file.write_all(data).map_err(map_io_error)?;
-
+        let path = path.as_str().to_string();
+        let data = data.to_vec();
+        self.runtime.block_on(async {
+            let mut file = self
+                .sftp
+                .open_with_flags(path, OpenFlags::WRITE)
+                .await
+                .map_err(map_sftp_error)?;
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(map_io_error)?;
+            file.write_all(&data).await.map_err(map_io_error)?;
+            file.flush().await.map_err(map_io_error)?;
             Ok(data.len() as u32)
         })
     }
 
     fn create(&self, path: &RemotePath, mode: u32) -> Result<FileAttributes> {
-        self.with_sftp(|sftp| {
-            let file = sftp
-                .open_mode(
-                    to_path(path),
-                    SftpOpenFlags::CREATE | SftpOpenFlags::EXCLUSIVE | SftpOpenFlags::WRITE,
-                    mode_i32(mode)?,
-                    OpenType::File,
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            let attributes = SftpAttributes {
+                permissions: Some(mode),
+                ..SftpAttributes::empty()
+            };
+            let _file = self
+                .sftp
+                .open_with_flags_and_attributes(
+                    path.clone(),
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                    attributes,
                 )
-                .map_err(map_ssh_error)?;
-            drop(file);
-
-            let stat = sftp.stat(to_path(path)).map_err(map_ssh_error)?;
-            file_attributes(stat)
+                .await
+                .map_err(map_sftp_error)?;
+            let metadata = self.sftp.metadata(path).await.map_err(map_sftp_error)?;
+            Ok(file_attributes(&metadata))
         })
     }
 
     fn mkdir(&self, path: &RemotePath, mode: u32) -> Result<FileAttributes> {
-        self.with_sftp(|sftp| {
-            sftp.mkdir(to_path(path), mode_i32(mode)?)
-                .map_err(map_ssh_error)?;
-            let stat = sftp.stat(to_path(path)).map_err(map_ssh_error)?;
-            file_attributes(stat)
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            self.sftp
+                .create_dir(path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            // create_dir takes no mode, so apply permissions best-effort after.
+            let attributes = SftpAttributes {
+                permissions: Some(mode),
+                ..SftpAttributes::empty()
+            };
+            let _ = self.sftp.set_metadata(path.clone(), attributes).await;
+            let metadata = self.sftp.metadata(path).await.map_err(map_sftp_error)?;
+            Ok(file_attributes(&metadata))
         })
     }
 
     fn unlink(&self, path: &RemotePath) -> Result<()> {
-        self.with_sftp(|sftp| sftp.unlink(to_path(path)).map_err(map_ssh_error))
+        let path = path.as_str().to_string();
+        self.runtime
+            .block_on(async { self.sftp.remove_file(path).await.map_err(map_sftp_error) })
     }
 
     fn rmdir(&self, path: &RemotePath) -> Result<()> {
-        self.with_sftp(|sftp| sftp.rmdir(to_path(path)).map_err(map_ssh_error))
+        let path = path.as_str().to_string();
+        self.runtime
+            .block_on(async { self.sftp.remove_dir(path).await.map_err(map_sftp_error) })
     }
 
     fn rename(&self, from: &RemotePath, to: &RemotePath) -> Result<()> {
-        self.with_sftp(|sftp| {
-            sftp.rename(to_path(from), to_path(to), None)
-                .map_err(map_ssh_error)
-        })
+        let from = from.as_str().to_string();
+        let to = to.as_str().to_string();
+        self.runtime
+            .block_on(async { self.sftp.rename(from, to).await.map_err(map_sftp_error) })
     }
 
     fn setattr(&self, path: &RemotePath, attributes: SetAttributes) -> Result<FileAttributes> {
-        self.with_sftp(|sftp| {
-            sftp.setstat(to_path(path), file_stat(attributes))
-                .map_err(map_ssh_error)?;
-
-            let stat = sftp.stat(to_path(path)).map_err(map_ssh_error)?;
-            file_attributes(stat)
+        let path = path.as_str().to_string();
+        self.runtime.block_on(async {
+            self.sftp
+                .set_metadata(path.clone(), set_attributes(&attributes))
+                .await
+                .map_err(map_sftp_error)?;
+            let metadata = self.sftp.metadata(path).await.map_err(map_sftp_error)?;
+            Ok(file_attributes(&metadata))
         })
     }
+}
+
+/// russh client handler. Its only job is host-key verification.
+struct ClientHandler {
+    known_hosts_files: Vec<PathBuf>,
+    accept_unknown_hosts: bool,
+    host: String,
+    port: u16,
+}
+
+impl client::Handler for ClientHandler {
+    type Error = russh::Error;
+
+    fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> impl Future<Output = std::result::Result<bool, Self::Error>> + Send {
+        // Decide synchronously, then hand back a ready future (no awaits here).
+        let mut accepted = self.accept_unknown_hosts;
+        for path in &self.known_hosts_files {
+            if !path.exists() {
+                continue;
+            }
+            match check_known_hosts_path(&self.host, self.port, server_public_key, path) {
+                Ok(true) => {
+                    accepted = true;
+                    break;
+                }
+                // Host not present in this file: keep looking.
+                Ok(false) => continue,
+                // Changed/conflicting key or unreadable file: reject.
+                Err(_) => {
+                    accepted = false;
+                    break;
+                }
+            }
+        }
+        async move { Ok(accepted) }
+    }
+}
+
+async fn connect_async(
+    options: &SftpConnectOptions,
+) -> Result<(Handle<ClientHandler>, SftpSession)> {
+    let config = Arc::new(client::Config::default());
+    let handler = ClientHandler {
+        known_hosts_files: options.known_hosts_files.clone(),
+        accept_unknown_hosts: options.accept_unknown_hosts,
+        host: options.target.host.clone(),
+        port: options.target.port,
+    };
+
+    let mut handle = client::connect(
+        config,
+        (options.target.host.as_str(), options.target.port),
+        handler,
+    )
+    .await
+    .map_err(map_russh_error)?;
+
+    authenticate(&mut handle, options).await?;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(map_russh_error)?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(map_russh_error)?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(map_sftp_error)?;
+
+    Ok((handle, sftp))
+}
+
+async fn authenticate(handle: &mut Handle<ClientHandler>, options: &SftpConnectOptions) -> Result<()> {
+    // The hash algorithm only matters for RSA keys; ed25519/ecdsa ignore it.
+    let rsa_hash = handle
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+
+    for identity_file in &options.identity_files {
+        if !identity_file.exists() {
+            continue;
+        }
+        let key = match load_secret_key(identity_file, options.passphrase.as_deref()) {
+            Ok(key) => Arc::new(key),
+            // Unreadable or wrong passphrase: try the next key.
+            Err(_) => continue,
+        };
+
+        let key = PrivateKeyWithHashAlg::new(key, rsa_hash);
+        match handle.authenticate_publickey(&options.target.username, key).await {
+            Ok(result) if result.success() => return Ok(()),
+            _ => continue,
+        }
+    }
+
+    Err(Error::PermissionDenied)
 }
 
 fn default_username() -> Result<String> {
@@ -260,63 +394,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-}
-
-fn verify_host_key(session: &Session, options: &SftpConnectOptions) -> Result<()> {
-    let (host_key, _) = session
-        .host_key()
-        .ok_or_else(|| Error::RemoteBackend("ssh server did not provide a host key".to_string()))?;
-
-    let mut known_hosts = session.known_hosts().map_err(map_ssh_error)?;
-    let mut loaded_files = 0;
-
-    for path in &options.known_hosts_files {
-        if !path.exists() {
-            continue;
-        }
-
-        known_hosts
-            .read_file(path, KnownHostFileKind::OpenSSH)
-            .map_err(map_ssh_error)?;
-        loaded_files += 1;
-    }
-
-    match known_hosts.check_port(&options.target.host, options.target.port, host_key) {
-        CheckResult::Match => Ok(()),
-        CheckResult::Mismatch => Err(Error::PermissionDenied),
-        CheckResult::NotFound if options.accept_unknown_hosts => Ok(()),
-        CheckResult::NotFound if loaded_files == 0 => Err(Error::PermissionDenied),
-        CheckResult::NotFound => Err(Error::PermissionDenied),
-        CheckResult::Failure => Err(Error::RemoteBackend(
-            "failed to verify ssh host key against known_hosts".to_string(),
-        )),
-    }
-}
-
-fn authenticate(session: &Session, options: &SftpConnectOptions) -> Result<()> {
-    if options.use_agent && session.userauth_agent(&options.target.username).is_ok() {
-        return Ok(());
-    }
-
-    for identity_file in &options.identity_files {
-        if !identity_file.exists() {
-            continue;
-        }
-
-        if session
-            .userauth_pubkey_file(
-                &options.target.username,
-                None,
-                identity_file,
-                options.passphrase.as_deref(),
-            )
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-
-    Err(Error::PermissionDenied)
 }
 
 fn parse_host_and_port(host_and_port: &str) -> Result<(String, u16)> {
@@ -352,55 +429,33 @@ fn parse_port(port: &str) -> Result<u16> {
         .map_err(|_| Error::InvalidInput(format!("invalid sftp target port: {port}")))
 }
 
-fn mode_i32(mode: u32) -> Result<i32> {
-    mode.try_into()
-        .map_err(|_| Error::InvalidInput(format!("file mode is too large: {mode}")))
-}
-
-fn to_path(path: &RemotePath) -> &Path {
-    Path::new(path.as_str())
-}
-
-fn file_name(path: PathBuf) -> Result<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            Error::RemoteBackend(format!("remote path has no valid file name: {path:?}"))
-        })
-}
-
-fn file_attributes(stat: FileStat) -> Result<FileAttributes> {
-    let mode = stat.perm.unwrap_or(0);
-
-    Ok(FileAttributes {
-        kind: file_kind(mode),
-        size: stat.size.unwrap_or(0),
+/// Convert russh-sftp file attributes into platform-neutral [`FileAttributes`].
+fn file_attributes(metadata: &SftpAttributes) -> FileAttributes {
+    let mode = metadata.permissions.unwrap_or(0);
+    FileAttributes {
+        kind: match metadata.file_type() {
+            FileType::Dir => FileKind::Directory,
+            FileType::Symlink => FileKind::Symlink,
+            _ => FileKind::File,
+        },
+        size: metadata.size.unwrap_or(0),
         mode,
-        uid: stat.uid.unwrap_or(0),
-        gid: stat.gid.unwrap_or(0),
-        modified_unix_seconds: stat.mtime.map(|mtime| mtime as i64),
-        accessed_unix_seconds: stat.atime.map(|atime| atime as i64),
+        uid: metadata.uid.unwrap_or(0),
+        gid: metadata.gid.unwrap_or(0),
+        modified_unix_seconds: metadata.mtime.map(|mtime| mtime as i64),
+        accessed_unix_seconds: metadata.atime.map(|atime| atime as i64),
         changed_unix_seconds: None,
-    })
-}
-
-fn file_kind(mode: u32) -> FileKind {
-    match mode & S_IFMT {
-        S_IFDIR => FileKind::Directory,
-        S_IFLNK => FileKind::Symlink,
-        _ => FileKind::File,
     }
 }
 
-fn file_stat(attributes: SetAttributes) -> FileStat {
-    FileStat {
+/// Convert a [`SetAttributes`] request into russh-sftp file attributes.
+fn set_attributes(attributes: &SetAttributes) -> SftpAttributes {
+    SftpAttributes {
         size: attributes.size,
-        uid: None,
-        gid: None,
-        perm: attributes.mode,
-        atime: attributes.accessed_unix_seconds.map(|atime| atime as u64),
-        mtime: attributes.modified_unix_seconds.map(|mtime| mtime as u64),
+        permissions: attributes.mode,
+        atime: attributes.accessed_unix_seconds.map(|atime| atime as u32),
+        mtime: attributes.modified_unix_seconds.map(|mtime| mtime as u32),
+        ..SftpAttributes::empty()
     }
 }
 
@@ -413,14 +468,33 @@ fn map_io_error(error: std::io::Error) -> Error {
     }
 }
 
-fn map_ssh_error(error: ssh2::Error) -> Error {
-    match error.code() {
-        ssh2::ErrorCode::SFTP(2) => Error::NotFound,
-        ssh2::ErrorCode::SFTP(3) => Error::PermissionDenied,
-        ssh2::ErrorCode::SFTP(8) => {
-            Error::UnsupportedOperation("remote sftp server does not support this operation")
-        }
-        _ => Error::RemoteBackend(error.to_string()),
+fn map_sftp_error(error: russh_sftp::client::error::Error) -> Error {
+    use russh_sftp::client::error::Error as SftpError;
+    match error {
+        SftpError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => Error::NotFound,
+            StatusCode::PermissionDenied => Error::PermissionDenied,
+            StatusCode::OpUnsupported => {
+                Error::UnsupportedOperation("remote sftp server does not support this operation")
+            }
+            _ => Error::RemoteBackend(format!("sftp error: {}", status.error_message)),
+        },
+        other => Error::RemoteBackend(format!("sftp error: {other}")),
+    }
+}
+
+fn map_russh_error(error: russh::Error) -> Error {
+    use russh::Error as SshError;
+    match &error {
+        SshError::IO(_) => Error::Unavailable(format!("ssh connection error: {error}")),
+        SshError::ConnectionTimeout
+        | SshError::KeepaliveTimeout
+        | SshError::InactivityTimeout
+        | SshError::HUP
+        | SshError::Disconnect => Error::Unavailable(format!("ssh connection lost: {error}")),
+        SshError::UnknownKey | SshError::KeyChanged { .. } => Error::PermissionDenied,
+        SshError::NotAuthenticated | SshError::NoAuthMethod => Error::PermissionDenied,
+        _ => Error::RemoteBackend(format!("ssh error: {error}")),
     }
 }
 
@@ -456,12 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn connection_options_default_to_strict_host_keys_and_agent_auth() {
+    fn connection_options_default_to_strict_host_keys() {
         let target = SftpTarget::parse("alice@example.com").unwrap();
         let options = SftpConnectOptions::for_target(target);
 
         assert!(!options.accept_unknown_hosts);
-        assert!(options.use_agent);
         assert_eq!(options.target.username, "alice");
     }
 
