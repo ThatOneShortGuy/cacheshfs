@@ -31,3 +31,16 @@ fn mount_owner() -> LinuxOwner {
         gid: unsafe { libc::getegid() },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_owner_uses_effective_process_identity() {
+        let owner = mount_owner();
+
+        assert_eq!(owner.uid, unsafe { libc::geteuid() });
+        assert_eq!(owner.gid, unsafe { libc::getegid() });
+    }
+}

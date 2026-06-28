@@ -343,6 +343,10 @@ fn unix_seconds(time: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cacheshfs_core::{
+        FileAttributes, FileKind, FileMetadata, NodeId, UnimplementedVirtualFilesystem,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn translates_read_only_open_flags() {
@@ -383,5 +387,32 @@ mod tests {
             Some(123)
         );
         assert_eq!(time_or_now(None), None);
+    }
+
+    #[test]
+    fn filesystem_attr_conversion_uses_configured_mount_owner() {
+        let owner = LinuxOwner {
+            uid: 1234,
+            gid: 5678,
+        };
+        let filesystem = LinuxFilesystem::new(Arc::new(UnimplementedVirtualFilesystem), owner);
+        let metadata = FileMetadata {
+            node: NodeId(99),
+            attributes: FileAttributes {
+                kind: FileKind::File,
+                size: 10,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                modified_unix_seconds: None,
+                accessed_unix_seconds: None,
+                changed_unix_seconds: None,
+            },
+        };
+
+        let attr = filesystem.file_attr(&metadata);
+
+        assert_eq!(attr.uid, owner.uid);
+        assert_eq!(attr.gid, owner.gid);
     }
 }
