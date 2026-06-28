@@ -2,7 +2,9 @@ use cacheshfs_core::{
     Error, FileAttributes, FileKind, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result,
     SetAttributes,
 };
-use ssh2::{FileStat, OpenFlags as SftpOpenFlags, OpenType, Session, Sftp};
+use ssh2::{
+    CheckResult, FileStat, KnownHostFileKind, OpenFlags as SftpOpenFlags, OpenType, Session, Sftp,
+};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -24,29 +26,41 @@ pub struct SftpTarget {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpConnectOptions {
+    pub target: SftpTarget,
+    pub known_hosts_files: Vec<PathBuf>,
+    pub accept_unknown_hosts: bool,
+    pub use_agent: bool,
+    pub identity_files: Vec<PathBuf>,
+    pub passphrase: Option<String>,
+}
+
 impl SftpBackend {
     pub fn connect(target: &str) -> Result<Self> {
         Self::connect_target(SftpTarget::parse(target)?)
     }
 
     pub fn connect_target(target: SftpTarget) -> Result<Self> {
-        let tcp = TcpStream::connect((target.host.as_str(), target.port)).map_err(|error| {
-            Error::Unavailable(format!(
-                "failed to connect to {}:{}: {error}",
-                target.host, target.port
-            ))
-        })?;
+        Self::connect_with_options(SftpConnectOptions::for_target(target))
+    }
+
+    pub fn connect_with_options(options: SftpConnectOptions) -> Result<Self> {
+        let tcp = TcpStream::connect((options.target.host.as_str(), options.target.port)).map_err(
+            |error| {
+                Error::Unavailable(format!(
+                    "failed to connect to {}:{}: {error}",
+                    options.target.host, options.target.port
+                ))
+            },
+        )?;
 
         let mut session = Session::new().map_err(map_ssh_error)?;
         session.set_tcp_stream(tcp);
         session.handshake().map_err(map_ssh_error)?;
-        session
-            .userauth_agent(&target.username)
-            .map_err(map_ssh_error)?;
 
-        if !session.authenticated() {
-            return Err(Error::PermissionDenied);
-        }
+        verify_host_key(&session, &options)?;
+        authenticate(&session, &options)?;
 
         let sftp = session.sftp().map_err(map_ssh_error)?;
 
@@ -82,6 +96,39 @@ impl SftpTarget {
             host,
             port,
         })
+    }
+}
+
+impl SftpConnectOptions {
+    pub fn for_target(target: SftpTarget) -> Self {
+        Self {
+            target,
+            known_hosts_files: default_known_hosts_files(),
+            accept_unknown_hosts: false,
+            use_agent: true,
+            identity_files: default_identity_files(),
+            passphrase: None,
+        }
+    }
+
+    pub fn accept_unknown_hosts(mut self, accept_unknown_hosts: bool) -> Self {
+        self.accept_unknown_hosts = accept_unknown_hosts;
+        self
+    }
+
+    pub fn with_known_hosts_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.known_hosts_files.push(path.into());
+        self
+    }
+
+    pub fn with_identity_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.identity_files.push(path.into());
+        self
+    }
+
+    pub fn with_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        self.passphrase = Some(passphrase.into());
+        self
     }
 }
 
@@ -191,6 +238,87 @@ fn default_username() -> Result<String> {
         .map_err(|_| Error::InvalidInput("sftp target must include a username".to_string()))
 }
 
+fn default_known_hosts_files() -> Vec<PathBuf> {
+    home_dir()
+        .map(|home| vec![home.join(".ssh").join("known_hosts")])
+        .unwrap_or_default()
+}
+
+fn default_identity_files() -> Vec<PathBuf> {
+    home_dir()
+        .map(|home| {
+            let ssh_dir = home.join(".ssh");
+            ["id_ed25519", "id_ecdsa", "id_rsa"]
+                .into_iter()
+                .map(|name| ssh_dir.join(name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn verify_host_key(session: &Session, options: &SftpConnectOptions) -> Result<()> {
+    let (host_key, _) = session
+        .host_key()
+        .ok_or_else(|| Error::RemoteBackend("ssh server did not provide a host key".to_string()))?;
+
+    let mut known_hosts = session.known_hosts().map_err(map_ssh_error)?;
+    let mut loaded_files = 0;
+
+    for path in &options.known_hosts_files {
+        if !path.exists() {
+            continue;
+        }
+
+        known_hosts
+            .read_file(path, KnownHostFileKind::OpenSSH)
+            .map_err(map_ssh_error)?;
+        loaded_files += 1;
+    }
+
+    match known_hosts.check_port(&options.target.host, options.target.port, host_key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch => Err(Error::PermissionDenied),
+        CheckResult::NotFound if options.accept_unknown_hosts => Ok(()),
+        CheckResult::NotFound if loaded_files == 0 => Err(Error::PermissionDenied),
+        CheckResult::NotFound => Err(Error::PermissionDenied),
+        CheckResult::Failure => Err(Error::RemoteBackend(
+            "failed to verify ssh host key against known_hosts".to_string(),
+        )),
+    }
+}
+
+fn authenticate(session: &Session, options: &SftpConnectOptions) -> Result<()> {
+    if options.use_agent && session.userauth_agent(&options.target.username).is_ok() {
+        return Ok(());
+    }
+
+    for identity_file in &options.identity_files {
+        if !identity_file.exists() {
+            continue;
+        }
+
+        if session
+            .userauth_pubkey_file(
+                &options.target.username,
+                None,
+                identity_file,
+                options.passphrase.as_deref(),
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    Err(Error::PermissionDenied)
+}
+
 fn parse_host_and_port(host_and_port: &str) -> Result<(String, u16)> {
     if host_and_port.is_empty() {
         return Err(Error::InvalidInput("sftp target host is empty".to_string()));
@@ -298,7 +426,7 @@ fn map_ssh_error(error: ssh2::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::SftpTarget;
+    use super::{SftpConnectOptions, SftpTarget};
 
     #[test]
     fn parses_user_host_target() {
@@ -325,5 +453,23 @@ mod tests {
         assert_eq!(target.username, "alice");
         assert_eq!(target.host, "2001:db8::1");
         assert_eq!(target.port, 2222);
+    }
+
+    #[test]
+    fn connection_options_default_to_strict_host_keys_and_agent_auth() {
+        let target = SftpTarget::parse("alice@example.com").unwrap();
+        let options = SftpConnectOptions::for_target(target);
+
+        assert!(!options.accept_unknown_hosts);
+        assert!(options.use_agent);
+        assert_eq!(options.target.username, "alice");
+    }
+
+    #[test]
+    fn connection_options_can_enable_unknown_host_acceptance() {
+        let target = SftpTarget::parse("alice@example.com").unwrap();
+        let options = SftpConnectOptions::for_target(target).accept_unknown_hosts(true);
+
+        assert!(options.accept_unknown_hosts);
     }
 }
