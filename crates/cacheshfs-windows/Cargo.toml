@@ -5,3 +5,13 @@ edition.workspace = true
 
 [dependencies]
 cacheshfs-core.workspace = true
+
+# WinFsp dependencies are target-gated so the workspace still compiles on
+# non-Windows hosts (where everything in this crate falls back to a stub).
+[target.'cfg(windows)'.dependencies]
+winfsp = "0.13"
+
+# `winfsp::build::winfsp_link_delayload()` (used in build.rs) lives behind the
+# `delayload` feature, which is part of winfsp's default `full` feature set.
+[target.'cfg(windows)'.build-dependencies]
+winfsp = "0.13"
