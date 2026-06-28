@@ -1,4 +1,4 @@
-use crate::attr::{DEFAULT_TTL, file_attr, file_type};
+use crate::attr::{DEFAULT_TTL, LinuxOwner, file_attr, file_type};
 use crate::error::errno;
 use cacheshfs_core::{FileHandle, NodeId, OpenFlags, SetAttributes, VirtualFilesystem};
 use fuser::{
@@ -11,11 +11,16 @@ use std::time::SystemTime;
 
 pub struct LinuxFilesystem {
     filesystem: Arc<dyn VirtualFilesystem>,
+    owner: LinuxOwner,
 }
 
 impl LinuxFilesystem {
-    pub fn new(filesystem: Arc<dyn VirtualFilesystem>) -> Self {
-        Self { filesystem }
+    pub fn new(filesystem: Arc<dyn VirtualFilesystem>, owner: LinuxOwner) -> Self {
+        Self { filesystem, owner }
+    }
+
+    fn file_attr(&self, metadata: &cacheshfs_core::FileMetadata) -> fuser::FileAttr {
+        file_attr(metadata, self.owner)
     }
 }
 
@@ -27,14 +32,18 @@ impl Filesystem for LinuxFilesystem {
         };
 
         match self.filesystem.lookup(NodeId(u64::from(parent)), name) {
-            Ok(metadata) => reply.entry(&DEFAULT_TTL, &file_attr(&metadata), fuser::Generation(0)),
+            Ok(metadata) => reply.entry(
+                &DEFAULT_TTL,
+                &self.file_attr(&metadata),
+                fuser::Generation(0),
+            ),
             Err(error) => reply.error(errno(error)),
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FuseFileHandle>, reply: ReplyAttr) {
         match self.filesystem.getattr(NodeId(u64::from(ino))) {
-            Ok(metadata) => reply.attr(&DEFAULT_TTL, &file_attr(&metadata)),
+            Ok(metadata) => reply.attr(&DEFAULT_TTL, &self.file_attr(&metadata)),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -65,7 +74,7 @@ impl Filesystem for LinuxFilesystem {
         };
 
         match self.filesystem.setattr(NodeId(u64::from(ino)), attributes) {
-            Ok(metadata) => reply.attr(&DEFAULT_TTL, &file_attr(&metadata)),
+            Ok(metadata) => reply.attr(&DEFAULT_TTL, &self.file_attr(&metadata)),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -88,7 +97,11 @@ impl Filesystem for LinuxFilesystem {
             .filesystem
             .mkdir(NodeId(u64::from(parent)), name, mode & !umask)
         {
-            Ok(metadata) => reply.entry(&DEFAULT_TTL, &file_attr(&metadata), fuser::Generation(0)),
+            Ok(metadata) => reply.entry(
+                &DEFAULT_TTL,
+                &self.file_attr(&metadata),
+                fuser::Generation(0),
+            ),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -291,7 +304,7 @@ impl Filesystem for LinuxFilesystem {
         ) {
             Ok(created) => reply.created(
                 &DEFAULT_TTL,
-                &file_attr(&created.metadata),
+                &self.file_attr(&created.metadata),
                 fuser::Generation(0),
                 FuseFileHandle(created.handle.0),
                 FopenFlags::empty(),
@@ -330,6 +343,10 @@ fn unix_seconds(time: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cacheshfs_core::{
+        FileAttributes, FileKind, FileMetadata, NodeId, UnimplementedVirtualFilesystem,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn translates_read_only_open_flags() {
@@ -370,5 +387,32 @@ mod tests {
             Some(123)
         );
         assert_eq!(time_or_now(None), None);
+    }
+
+    #[test]
+    fn filesystem_attr_conversion_uses_configured_mount_owner() {
+        let owner = LinuxOwner {
+            uid: 1234,
+            gid: 5678,
+        };
+        let filesystem = LinuxFilesystem::new(Arc::new(UnimplementedVirtualFilesystem), owner);
+        let metadata = FileMetadata {
+            node: NodeId(99),
+            attributes: FileAttributes {
+                kind: FileKind::File,
+                size: 10,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                modified_unix_seconds: None,
+                accessed_unix_seconds: None,
+                changed_unix_seconds: None,
+            },
+        };
+
+        let attr = filesystem.file_attr(&metadata);
+
+        assert_eq!(attr.uid, owner.uid);
+        assert_eq!(attr.gid, owner.gid);
     }
 }

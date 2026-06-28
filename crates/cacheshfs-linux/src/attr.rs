@@ -5,7 +5,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
-pub fn file_attr(metadata: &FileMetadata) -> FileAttr {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+pub fn file_attr(metadata: &FileMetadata, owner: LinuxOwner) -> FileAttr {
     let attributes = &metadata.attributes;
 
     FileAttr {
@@ -19,8 +25,8 @@ pub fn file_attr(metadata: &FileMetadata) -> FileAttr {
         kind: file_type(attributes.kind),
         perm: permissions(attributes),
         nlink: link_count(attributes.kind),
-        uid: attributes.uid,
-        gid: attributes.gid,
+        uid: owner.uid,
+        gid: owner.gid,
         rdev: 0,
         blksize: DEFAULT_BLOCK_SIZE,
         flags: 0,
@@ -69,6 +75,11 @@ mod tests {
     use super::*;
     use cacheshfs_core::{FileAttributes, FileKind, FileMetadata, NodeId};
 
+    const TEST_OWNER: LinuxOwner = LinuxOwner {
+        uid: 1000,
+        gid: 1001,
+    };
+
     #[test]
     fn converts_regular_file_metadata_to_fuser_attr() {
         let metadata = FileMetadata {
@@ -85,7 +96,7 @@ mod tests {
             },
         };
 
-        let attr = file_attr(&metadata);
+        let attr = file_attr(&metadata, TEST_OWNER);
 
         assert_eq!(attr.ino, INodeNo(42));
         assert_eq!(attr.size, 1025);
@@ -100,20 +111,37 @@ mod tests {
 
     #[test]
     fn supplies_default_permissions_when_remote_mode_is_missing() {
-        assert_eq!(file_attr(&metadata(FileKind::File, 0)).perm, 0o644);
-        assert_eq!(file_attr(&metadata(FileKind::Directory, 0)).perm, 0o755);
-        assert_eq!(file_attr(&metadata(FileKind::Symlink, 0)).perm, 0o777);
+        assert_eq!(
+            file_attr(&metadata(FileKind::File, 0), TEST_OWNER).perm,
+            0o644
+        );
+        assert_eq!(
+            file_attr(&metadata(FileKind::Directory, 0), TEST_OWNER).perm,
+            0o755
+        );
+        assert_eq!(
+            file_attr(&metadata(FileKind::Symlink, 0), TEST_OWNER).perm,
+            0o777
+        );
     }
 
     #[test]
     fn maps_file_kinds_to_fuser_types_and_link_counts() {
-        let directory = file_attr(&metadata(FileKind::Directory, 0o755));
-        let symlink = file_attr(&metadata(FileKind::Symlink, 0o777));
+        let directory = file_attr(&metadata(FileKind::Directory, 0o755), TEST_OWNER);
+        let symlink = file_attr(&metadata(FileKind::Symlink, 0o777), TEST_OWNER);
 
         assert_eq!(directory.kind, FileType::Directory);
         assert_eq!(directory.nlink, 2);
         assert_eq!(symlink.kind, FileType::Symlink);
         assert_eq!(symlink.nlink, 1);
+    }
+
+    #[test]
+    fn maps_remote_ownership_to_mount_owner() {
+        let attr = file_attr(&metadata(FileKind::File, 0o644), TEST_OWNER);
+
+        assert_eq!(attr.uid, TEST_OWNER.uid);
+        assert_eq!(attr.gid, TEST_OWNER.gid);
     }
 
     fn metadata(kind: FileKind, mode: u32) -> FileMetadata {
