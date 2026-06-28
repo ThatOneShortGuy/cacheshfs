@@ -45,7 +45,8 @@ fn run(cli: Cli) -> Result<(), String> {
 
     // The shared cache-backed VFS sits between the platform mount backend and
     // the remote transport.
-    let filesystem: Arc<dyn VirtualFilesystem> = Arc::new(CacheVfs::new(Arc::new(remote), root));
+    let filesystem: Arc<dyn VirtualFilesystem> =
+        Arc::new(CacheVfs::new(Arc::new(remote), root, config.read_only));
 
     platform_backend()
         .mount(config, filesystem)
