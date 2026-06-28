@@ -326,3 +326,49 @@ fn unix_seconds(time: SystemTime) -> Option<i64> {
         Err(error) => Some(-(error.duration().as_secs() as i64)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_read_only_open_flags() {
+        let flags = open_flags(fuser::OpenFlags(libc::O_RDONLY));
+
+        assert!(flags.read);
+        assert!(!flags.write);
+        assert!(!flags.append);
+        assert!(!flags.truncate);
+    }
+
+    #[test]
+    fn translates_write_only_open_flags() {
+        let flags = open_flags(fuser::OpenFlags(libc::O_WRONLY | libc::O_APPEND));
+
+        assert!(!flags.read);
+        assert!(flags.write);
+        assert!(flags.append);
+        assert!(!flags.truncate);
+    }
+
+    #[test]
+    fn translates_read_write_truncate_open_flags() {
+        let flags = open_flags(fuser::OpenFlags(libc::O_RDWR | libc::O_TRUNC));
+
+        assert!(flags.read);
+        assert!(flags.write);
+        assert!(!flags.append);
+        assert!(flags.truncate);
+    }
+
+    #[test]
+    fn converts_specific_times_to_unix_seconds() {
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+
+        assert_eq!(
+            time_or_now(Some(fuser::TimeOrNow::SpecificTime(time))),
+            Some(123)
+        );
+        assert_eq!(time_or_now(None), None);
+    }
+}
