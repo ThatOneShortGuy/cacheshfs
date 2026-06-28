@@ -1,3 +1,4 @@
+use crate::attr::LinuxOwner;
 use crate::fs::LinuxFilesystem;
 use cacheshfs_core::{Error, MountConfig, Result, VirtualFilesystem};
 use fuser::{Config, MountOption};
@@ -17,9 +18,29 @@ pub fn mount(config: MountConfig, filesystem: Arc<dyn VirtualFilesystem>) -> Res
     options.mount_options = mount_options;
 
     fuser::mount2(
-        LinuxFilesystem::new(filesystem),
+        LinuxFilesystem::new(filesystem, mount_owner()),
         &config.mountpoint,
         &options,
     )
     .map_err(|error| Error::MountBackend(error.to_string()))
+}
+
+fn mount_owner() -> LinuxOwner {
+    LinuxOwner {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_owner_uses_effective_process_identity() {
+        let owner = mount_owner();
+
+        assert_eq!(owner.uid, unsafe { libc::geteuid() });
+        assert_eq!(owner.gid, unsafe { libc::getegid() });
+    }
 }
