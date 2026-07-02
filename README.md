@@ -29,14 +29,30 @@ cargo build --release
 
 Platform mount backends have extra build/runtime requirements:
 
-- **Linux** — libfuse (the `fuser` crate links against it).
+- **Linux** — libfuse (the `fuser` crate links against it). `cargo build` works
+  directly.
 - **Windows** — the [WinFsp](https://winfsp.dev/) runtime installed, plus
-  LLVM/libclang and the MSVC/Windows SDK headers on `PATH` to build (easiest from
-  a *Developer PowerShell for VS*). See
+  LLVM/libclang and the MSVC/Windows SDK. The `winfsp-sys` build script runs
+  `bindgen`, which needs `windows.h` and the SDK include paths — these only
+  exist inside a **Visual Studio Developer environment**. In a plain terminal the
+  first build fails with `'windows.h' file not found`. Two ways to build:
+
+  ```powershell
+  # 1. Use the wrapper, which sets up the VS environment then runs cargo:
+  .\build.ps1                       # == cargo build
+  .\build.ps1 test -p cacheshfs
+  .\build.ps1 run -- server:/srv Z:
+
+  # 2. Or run cargo yourself from a "Developer PowerShell for VS".
+  ```
+
+  Once `winfsp-sys` has compiled, a plain `cargo build` reuses it and works
+  normally — until a `cargo clean`, fresh clone, or dependency bump invalidates
+  it, when you need the VS environment (i.e. `build.ps1`) again. See
   [`crates/cacheshfs-windows/README.md`](crates/cacheshfs-windows/README.md).
 
-A bare `cargo build`/`cargo run` at the workspace root works on any platform: the
-mount crate for the current OS is built and the other is compiled as an inert
+A bare `cargo build`/`cargo run` at the workspace root targets both mount crates:
+the one for the current OS is built for real and the other compiles to an inert
 stub.
 
 ## Usage
