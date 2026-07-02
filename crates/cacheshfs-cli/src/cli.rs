@@ -92,8 +92,9 @@ pub enum CacheModeArg {
     Remote,
     /// Cache files and metadata as they are accessed. The first read of a file
     /// downloads and stores it; later reads are served locally until the server
-    /// copy changes (revalidated by size/mtime) or the file is written. Best
-    /// general-purpose mode.
+    /// copy changes (revalidated by size/mtime) or the file is written. If the
+    /// server becomes unreachable, already-cached files and listings keep being
+    /// served instead of erroring. Best general-purpose mode.
     OnDemand,
     /// Like on-demand today (a distinct keep-resident/prefetch policy is not yet
     /// implemented, so it currently behaves the same as `on-demand`).

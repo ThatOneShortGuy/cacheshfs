@@ -97,7 +97,7 @@ Run `cacheshfs --help` for full option descriptions.
 | Mode | Behavior |
 | --- | --- |
 | `remote` | Pass-through; nothing is cached locally. |
-| `on-demand` *(default)* | Cache files/metadata on access; revalidate and re-fetch when the server copy changes. |
+| `on-demand` *(default)* | Cache files/metadata on access; revalidate and re-fetch when the server copy changes. If the server becomes unreachable, already-cached files and listings keep being served. |
 | `pinned` | Currently behaves like `on-demand` (a keep-resident/prefetch policy is not yet implemented). |
 | `offline` | Serve only from the persistent cache; never connect. Uncached paths report not-found and writes are rejected. |
 

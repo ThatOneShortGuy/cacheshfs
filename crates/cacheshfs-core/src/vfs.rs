@@ -204,6 +204,44 @@ impl CacheVfs {
     fn child_path(&self, parent: NodeId, name: &str) -> Result<RemotePath> {
         self.lock().path_of(parent)?.join(name)
     }
+
+    /// Build a directory listing from the persistent store, or `None` if the
+    /// directory's listing was never cached. Reads the store first (its lock)
+    /// then interns nodes (the state lock) — never holding both at once.
+    fn readdir_from_cache(&self, path: &RemotePath) -> Option<Vec<DirectoryEntry>> {
+        let children = self.store.get_children(path)?;
+        let mut collected = Vec::with_capacity(children.len());
+        for name in &children {
+            let child_path = path.join(name).ok()?;
+            if let Some(attributes) = self.store.get_attrs(&child_path) {
+                collected.push((name.clone(), child_path, attributes));
+            }
+        }
+        let mut state = self.lock();
+        Some(
+            collected
+                .into_iter()
+                .map(|(name, child_path, attributes)| {
+                    let child = state.intern(child_path);
+                    DirectoryEntry {
+                        name,
+                        metadata: FileMetadata {
+                            node: child,
+                            attributes,
+                        },
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Whether an error means the remote could not be reached (as opposed to a
+/// definitive answer like not-found or permission-denied). Online cache modes
+/// fall back to cached data on these so downloaded files keep working when the
+/// connection drops; a reachable server always stays authoritative.
+fn is_unreachable(error: &Error) -> bool {
+    matches!(error, Error::Unavailable(_))
 }
 
 /// A remote that is never reachable, used by [`CacheVfs::offline`]. In offline
@@ -291,7 +329,15 @@ impl VirtualFilesystem for CacheVfs {
                     .insert((parent, name.to_string()), Instant::now());
                 Err(Error::NotFound)
             }
-            Err(other) => Err(other),
+            // Server unreachable: fall back to a cached copy of the child so
+            // previously seen entries resolve offline.
+            Err(error) => match self.store.get_attrs(&child_path) {
+                Some(attributes) if is_unreachable(&error) => {
+                    let node = self.lock().intern(child_path);
+                    Ok(FileMetadata { node, attributes })
+                }
+                _ => Err(error),
+            },
         }
     }
 
@@ -316,7 +362,15 @@ impl VirtualFilesystem for CacheVfs {
                 self.store.remove(&path);
                 Err(Error::NotFound)
             }
-            Err(other) => Err(other),
+            // Server unreachable: serve the cached attributes if we have them so
+            // previously seen files keep working offline. Server-wins still
+            // applies whenever the server is actually reachable.
+            Err(error) => match self.store.get_attrs(&path) {
+                Some(attributes) if is_unreachable(&error) => {
+                    Ok(FileMetadata { node, attributes })
+                }
+                _ => Err(error),
+            },
         }
     }
 
@@ -324,38 +378,27 @@ impl VirtualFilesystem for CacheVfs {
         let path = self.lock().path_of(node)?;
 
         if self.metadata_fresh(&path)
-            && let Some(children) = self.store.get_children(&path)
+            && let Some(result) = self.readdir_from_cache(&path)
         {
-            // Gather child attributes (store lock) then intern nodes (state
-            // lock) — never holding both locks at once.
-            let mut collected = Vec::with_capacity(children.len());
-            for name in &children {
-                let child_path = path.join(name)?;
-                if let Some(attributes) = self.store.get_attrs(&child_path) {
-                    collected.push((name.clone(), child_path, attributes));
-                }
-            }
-            let mut state = self.lock();
-            let result = collected
-                .into_iter()
-                .map(|(name, child_path, attributes)| {
-                    let child = state.intern(child_path);
-                    DirectoryEntry {
-                        name,
-                        metadata: FileMetadata {
-                            node: child,
-                            attributes,
-                        },
-                    }
-                })
-                .collect();
             return Ok(result);
         }
         if self.offline() {
             return Err(Error::NotFound);
         }
 
-        let entries = self.remote.read_dir(&path)?;
+        let entries = match self.remote.read_dir(&path) {
+            Ok(entries) => entries,
+            // Server unreachable: serve the cached listing if we have one so a
+            // previously listed directory stays browsable offline.
+            Err(error) => {
+                if is_unreachable(&error)
+                    && let Some(result) = self.readdir_from_cache(&path)
+                {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
+        };
         let now = Instant::now();
         let mut children = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -597,6 +640,8 @@ mod tests {
         stat_calls: usize,
         read_dir_calls: usize,
         read_calls: usize,
+        /// when set, reads fail as if the connection dropped
+        unreachable: bool,
     }
 
     /// In-memory mutable remote tree (interior mutability so `&self` methods can
@@ -675,8 +720,15 @@ mod tests {
                     stat_calls: 0,
                     read_dir_calls: 0,
                     read_calls: 0,
+                    unreachable: false,
                 }),
             }
+        }
+
+        /// Simulate the connection dropping: subsequent stat/read_dir/read calls
+        /// fail with `Error::Unavailable`, as the SFTP transport reports.
+        fn set_unreachable(&self, unreachable: bool) {
+            self.state.lock().unwrap().unreachable = unreachable;
         }
 
         fn stat_calls(&self) -> usize {
@@ -706,6 +758,9 @@ mod tests {
         fn stat(&self, path: &RemotePath) -> Result<FileAttributes> {
             let mut state = self.state.lock().unwrap();
             state.stat_calls += 1;
+            if state.unreachable {
+                return Err(Error::Unavailable("connection lost".into()));
+            }
             state
                 .nodes
                 .get(path.as_str())
@@ -716,6 +771,9 @@ mod tests {
         fn read_dir(&self, path: &RemotePath) -> Result<Vec<RemoteDirectoryEntry>> {
             let mut state = self.state.lock().unwrap();
             state.read_dir_calls += 1;
+            if state.unreachable {
+                return Err(Error::Unavailable("connection lost".into()));
+            }
             let names = state.dirs.get(path.as_str()).ok_or(Error::NotFound)?;
             Ok(names
                 .iter()
@@ -733,6 +791,9 @@ mod tests {
         fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
             let mut state = self.state.lock().unwrap();
             state.read_calls += 1;
+            if state.unreachable {
+                return Err(Error::Unavailable("connection lost".into()));
+            }
             let (_, contents) = state.nodes.get(path.as_str()).ok_or(Error::NotFound)?;
             let contents = contents
                 .as_ref()
@@ -1574,5 +1635,61 @@ mod tests {
             vfs.lookup(NodeId::ROOT, "readme.txt"),
             Err(Error::NotFound)
         ));
+    }
+
+    #[test]
+    fn getattr_falls_back_to_cache_when_remote_unreachable() {
+        // Zero TTL forces a revalidation on every getattr.
+        let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
+        let node = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
+        let online = vfs.getattr(node).unwrap().attributes;
+
+        // The connection drops; getattr serves the cached attributes instead of
+        // surfacing the connection error.
+        remote.set_unreachable(true);
+        let offline = vfs.getattr(node).unwrap().attributes;
+        assert_eq!(offline, online);
+    }
+
+    #[test]
+    fn lookup_falls_back_to_cache_but_uncached_paths_surface_the_error() {
+        let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
+        let online = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().attributes;
+
+        remote.set_unreachable(true);
+        // A previously seen child still resolves from the cache.
+        let offline = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().attributes;
+        assert_eq!(offline, online);
+        // A never-seen child has nothing cached, so the error is surfaced.
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "never-seen.txt"),
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn readdir_falls_back_to_cache_when_remote_unreachable() {
+        let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
+        let names = |entries: &[DirectoryEntry]| {
+            entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
+        };
+        let online = names(&vfs.readdir(NodeId::ROOT).unwrap());
+
+        remote.set_unreachable(true);
+        let offline = names(&vfs.readdir(NodeId::ROOT).unwrap());
+        assert_eq!(offline, online);
+    }
+
+    #[test]
+    fn read_serves_cached_content_when_remote_unreachable() {
+        // Zero TTL forces the read path's getattr to revalidate every time.
+        let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
+        let (_node, handle) = open_for_read(&vfs, "readme.txt");
+        // First read hydrates from the server.
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+
+        // Connection drops: the already-downloaded content is still served.
+        remote.set_unreachable(true);
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
     }
 }

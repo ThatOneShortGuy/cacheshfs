@@ -49,6 +49,15 @@ dropped and the file is re-hydrated from the server. `getattr`/`lookup` that hit
 reconcile — writes are write-through (below) — so a divergence always resolves
 in the server's favour.
 
+### Graceful degradation when unreachable
+
+Being *unreachable* is distinguished from being *deleted*. When revalidation in
+an online mode fails with a connectivity error (`Error::Unavailable`) rather than
+`NotFound`, `getattr`/`lookup`/`readdir` fall back to the cached copy if one
+exists, so already-downloaded files and previously listed directories keep
+working after the connection drops. A reachable server always stays
+authoritative; a request with nothing cached still surfaces the error.
+
 ### Offline
 
 `CacheMode::Offline` (and the `CacheVfs::new_offline` constructor, which takes no
