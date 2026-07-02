@@ -190,7 +190,6 @@ impl VirtualFilesystem for WritableDemoVfs {
 }
 
 #[test]
-#[ignore = "write support is still under implementation"]
 fn mounted_fuse_filesystem_creates_and_writes_file_contents() {
     if !fuse_is_available() {
         eprintln!("skipping FUSE write e2e test: /dev/fuse or fusermount3 is unavailable");

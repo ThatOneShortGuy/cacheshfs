@@ -117,6 +117,11 @@ impl FileSystemContext for CacheFs {
         };
 
         fill_file_info(&metadata.attributes, metadata.node.0, file_info.as_mut());
+        // Tell WinFsp the file's real (case-preserved) name. Without this, a
+        // case-insensitive volume upper-cases the name for later operations
+        // (e.g. cleanup/delete), which then fails against the case-sensitive
+        // remote.
+        file_info.set_normalized_name(file_name.as_slice(), None);
         Ok(CacheFile {
             node: metadata.node,
             handle,
@@ -151,6 +156,7 @@ impl FileSystemContext for CacheFs {
             let mode = mode_for_create(file_attributes, true);
             let metadata = self.vfs.mkdir(parent, &name, mode).map_err(to_fsp)?;
             fill_file_info(&metadata.attributes, metadata.node.0, file_info.as_mut());
+            file_info.set_normalized_name(file_name.as_slice(), None);
             Ok(CacheFile {
                 node: metadata.node,
                 handle: None,
@@ -170,6 +176,7 @@ impl FileSystemContext for CacheFs {
                 created.metadata.node.0,
                 file_info.as_mut(),
             );
+            file_info.set_normalized_name(file_name.as_slice(), None);
             Ok(CacheFile {
                 node: created.metadata.node,
                 handle: Some(created.handle),
@@ -184,7 +191,9 @@ impl FileSystemContext for CacheFs {
         if flags & FSP_CLEANUP_DELETE == 0 || !context.delete_pending.load(Ordering::SeqCst) {
             return;
         }
-        // `file_name` is supplied by WinFsp when a delete is requested.
+        // `file_name` is supplied by WinFsp when a delete is requested. Because
+        // `open`/`create` set the normalized name, this carries the file's real
+        // (case-preserved) name, which matters for the case-sensitive remote.
         let Some(file_name) = file_name else { return };
         let Ok((parent, name)) = resolve_parent(self.vfs.as_ref(), file_name) else {
             return;
