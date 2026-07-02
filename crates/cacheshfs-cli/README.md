@@ -14,7 +14,7 @@ cacheshfs [OPTIONS] [user@]host:/remote/path <mountpoint>
 ## Wired options
 
 - positional remote `[user@]host:/remote/path` and `mountpoint`
-- `--cache-dir`, `--cache-mode`, `--read-only` → `MountConfig`
+- `--cache-dir`, `--cache-mode`, `--cache-chunk-size`, `--read-only` → `MountConfig`
 - `--metadata-ttl` (e.g. `30s`, `5m`) → metadata cache TTL in `CacheVfs`
 - `--port`, `--identity-file`, `--accept-unknown-host-key`, `--ssh-config` →
   SFTP connection (`SftpConnectOptions`)

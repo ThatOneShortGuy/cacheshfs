@@ -50,6 +50,7 @@ fn run(cli: Cli) -> Result<(), String> {
             config.read_only,
             metadata_ttl,
             config.cache_dir.clone(),
+            config.cache_chunk_size,
         ))
     } else {
         let options = cli.connect_options(&config.remote.target)?;
@@ -65,6 +66,7 @@ fn run(cli: Cli) -> Result<(), String> {
             config.cache_mode,
             metadata_ttl,
             config.cache_dir.clone(),
+            config.cache_chunk_size,
         ))
     };
 

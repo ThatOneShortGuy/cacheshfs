@@ -114,6 +114,7 @@ Important options:
 
 - `--cache-dir PATH`: directory for persistent cache state.
 - `--cache-mode MODE`: one of `remote`, `on-demand`, `pinned`, or `offline`.
+- `--cache-chunk-size SIZE`: content cache chunk size; defaults to `4 MiB`.
 - `--metadata-ttl DURATION`: how long cached metadata is trusted.
 - `--content-ttl DURATION`: how long clean cached file contents are trusted before revalidation.
 - `--download PATH`: prefetch a remote path into the cache before or after mounting.

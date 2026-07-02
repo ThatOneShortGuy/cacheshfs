@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cacheshfs_core::{CacheMode, MountConfig, RemoteConfig};
+use cacheshfs_core::{CacheMode, DEFAULT_CACHE_CHUNK_SIZE, MountConfig, RemoteConfig};
 use cacheshfs_sftp::{SftpConnectOptions, SftpTarget};
 use clap::{Parser, ValueEnum};
 
@@ -32,6 +32,10 @@ pub struct Cli {
     /// Cache mode.
     #[arg(long, value_name = "MODE", default_value = "on-demand")]
     pub cache_mode: CacheModeArg,
+
+    /// Content cache chunk size. Accepts bytes or K/M/G suffixes, e.g. 4M.
+    #[arg(long, value_name = "SIZE")]
+    pub cache_chunk_size: Option<String>,
 
     /// Prevent all write operations.
     #[arg(long)]
@@ -90,11 +94,11 @@ pub enum CacheModeArg {
     /// nothing is written to the local content cache. Lowest memory/disk use,
     /// no offline reads, and no speedup on repeated access.
     Remote,
-    /// Cache files and metadata as they are accessed. The first read of a file
-    /// downloads and stores it; later reads are served locally until the server
-    /// copy changes (revalidated by size/mtime) or the file is written. If the
-    /// server becomes unreachable, already-cached files and listings keep being
-    /// served instead of erroring. Best general-purpose mode.
+    /// Cache file chunks and metadata as they are accessed. The first read of a
+    /// chunk downloads and stores it; later reads are served locally until the
+    /// server copy changes (revalidated by size/mtime) or the file is written.
+    /// If the server becomes unreachable, already-cached chunks and listings
+    /// keep being served instead of erroring. Best general-purpose mode.
     OnDemand,
     /// Like on-demand today (a distinct keep-resident/prefetch policy is not yet
     /// implemented, so it currently behaves the same as `on-demand`).
@@ -153,11 +157,17 @@ impl Cli {
             ));
         }
 
+        let cache_chunk_size = match &self.cache_chunk_size {
+            Some(text) => parse_byte_size(text)?,
+            None => DEFAULT_CACHE_CHUNK_SIZE,
+        };
+
         Ok(MountConfig {
             remote,
             mountpoint: self.mountpoint.clone(),
             cache_dir,
             cache_mode: self.cache_mode.into(),
+            cache_chunk_size,
             read_only: self.read_only,
         })
     }
@@ -311,6 +321,40 @@ fn default_cache_dir() -> PathBuf {
     PathBuf::from(".cacheshfs-cache")
 }
 
+fn parse_byte_size(text: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("byte size must not be empty".to_string());
+    }
+
+    let digits = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits == 0 {
+        return Err(format!("invalid byte size '{text}'"));
+    }
+
+    let value: u64 = trimmed[..digits]
+        .parse()
+        .map_err(|_| format!("invalid byte size '{text}'"))?;
+    if value == 0 {
+        return Err("byte size must be greater than zero".to_string());
+    }
+
+    let suffix = trimmed[digits..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return Err(format!("invalid byte size suffix in '{text}'")),
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size '{text}' is too large"))
+}
+
 /// Whether `path` is equal to or nested under `ancestor`, using a lexical
 /// comparison of normalized forms (no filesystem access, since the mountpoint
 /// may not exist yet).
@@ -384,6 +428,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/remote"),
             cache_dir: Some(PathBuf::from("/mnt/remote/.cache")),
             cache_mode: CacheModeArg::OnDemand,
+            cache_chunk_size: None,
             read_only: false,
             port: None,
             identity_file: None,
@@ -404,6 +449,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/remote"),
             cache_dir: Some(PathBuf::from("/var/cache/cacheshfs")),
             cache_mode: CacheModeArg::OnDemand,
+            cache_chunk_size: None,
             read_only: true,
             port: None,
             identity_file: None,
@@ -438,6 +484,7 @@ mod parse_tests {
         assert_eq!(cli.mountpoint, PathBuf::from("/mnt"));
         // Defaults from the spec.
         assert_eq!(cli.cache_mode, CacheModeArg::OnDemand);
+        assert!(cli.cache_chunk_size.is_none());
         assert!(!cli.read_only);
         assert!(cli.cache_dir.is_none());
         assert!(cli.port.is_none());
@@ -454,6 +501,8 @@ mod parse_tests {
             "/var/cache/cacheshfs",
             "--cache-mode",
             "pinned",
+            "--cache-chunk-size",
+            "8MiB",
             "--read-only",
             "--port",
             "2222",
@@ -473,6 +522,7 @@ mod parse_tests {
 
         assert_eq!(cli.cache_dir, Some(PathBuf::from("/var/cache/cacheshfs")));
         assert_eq!(cli.cache_mode, CacheModeArg::Pinned);
+        assert_eq!(cli.cache_chunk_size.as_deref(), Some("8MiB"));
         assert!(cli.read_only);
         assert_eq!(cli.port, Some(2222));
         assert_eq!(cli.metadata_ttl.as_deref(), Some("30s"));
@@ -654,14 +704,60 @@ mod parse_tests {
             "/var/cache/cacheshfs",
             "--cache-mode",
             "offline",
+            "--cache-chunk-size",
+            "2M",
         ])
         .unwrap();
         let config = cli.to_mount_config().unwrap();
         assert_eq!(config.remote.target, "bob@winhost");
         assert_eq!(config.remote.root, "/C:/Users/bob");
         assert_eq!(config.cache_mode, CacheMode::Offline);
+        assert_eq!(config.cache_chunk_size, 2 * 1024 * 1024);
         assert_eq!(config.cache_dir, PathBuf::from("/var/cache/cacheshfs"));
         assert!(!config.read_only);
+    }
+
+    #[test]
+    fn cache_chunk_size_defaults_and_parses() {
+        let default = parse(&["cacheshfs", "host:/srv", "/mnt"]).unwrap();
+        assert_eq!(
+            default.to_mount_config().unwrap().cache_chunk_size,
+            DEFAULT_CACHE_CHUNK_SIZE
+        );
+
+        for (text, expected) in [
+            ("4096", 4096),
+            ("4K", 4 * 1024),
+            ("4MB", 4 * 1024 * 1024),
+            ("4MiB", 4 * 1024 * 1024),
+            ("1G", 1024 * 1024 * 1024),
+        ] {
+            let cli = parse(&[
+                "cacheshfs",
+                "host:/srv",
+                "/mnt",
+                "--cache-chunk-size",
+                text,
+            ])
+            .unwrap();
+            assert_eq!(cli.to_mount_config().unwrap().cache_chunk_size, expected);
+        }
+    }
+
+    #[test]
+    fn cache_chunk_size_rejects_invalid_values() {
+        for text in ["0", "", "abc", "4XB"] {
+            let cli = parse(&[
+                "cacheshfs",
+                "host:/srv",
+                "/mnt",
+                "--cache-chunk-size",
+                text,
+            ]);
+            if let Ok(cli) = cli {
+                assert!(cli.to_mount_config().is_err(), "value {text} should fail");
+            }
+        }
     }
 
     #[test]

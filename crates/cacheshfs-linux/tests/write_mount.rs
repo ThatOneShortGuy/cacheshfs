@@ -210,6 +210,7 @@ fn mounted_fuse_filesystem_creates_and_writes_file_contents() {
         mountpoint: mountpoint.clone(),
         cache_dir,
         cache_mode: CacheMode::Remote,
+        cache_chunk_size: cacheshfs_core::DEFAULT_CACHE_CHUNK_SIZE,
         read_only: false,
     };
 

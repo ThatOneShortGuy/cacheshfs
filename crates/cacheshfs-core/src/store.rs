@@ -1,8 +1,8 @@
-//! Persistent, path-keyed cache store: metadata and whole-file content.
+//! Persistent, path-keyed cache store: metadata and chunked file content.
 //!
 //! Everything the cache knows about a remote path — its attributes, directory
-//! listings, and a reference to hydrated content — lives in a single JSON index
-//! (`cache_dir/index.json`) plus content objects under `cache_dir/objects`.
+//! listings, and references to cached content chunks — lives in a single JSON
+//! index (`cache_dir/index.json`) plus content objects under `cache_dir/objects`.
 //! Because the index is keyed by the (stable) remote path and persisted, a mount
 //! can serve previously cached files after a restart, including offline when the
 //! server is unreachable.
@@ -24,9 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, FileAttributes, FileKind, RemoteFilesystem, RemotePath, Result};
-
-/// Whole-file downloads are streamed in chunks of this size.
-const CHUNK: u32 = 128 * 1024;
 
 fn cache_io(error: std::io::Error) -> Error {
     Error::RemoteBackend(format!("content cache io error: {error}"))
@@ -95,9 +92,16 @@ impl From<&StoredAttrs> for FileAttributes {
 /// Reference to a hydrated content object and the version it holds.
 #[derive(Clone, Serialize, Deserialize)]
 struct ContentRef {
-    object: u64,
     size: u64,
     modified: Option<i64>,
+    #[serde(default)]
+    chunk_size: u64,
+    #[serde(default)]
+    chunks: HashMap<u64, u64>,
+    // Legacy whole-file object from earlier cache indexes. If present, stale
+    // cleanup removes it; new reads use chunk objects only.
+    #[serde(default)]
+    object: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +123,7 @@ struct Index {
 
 pub(crate) struct Store {
     dir: PathBuf,
+    chunk_size: u64,
     temp_counter: AtomicU64,
     index: Mutex<Index>,
 }
@@ -126,13 +131,14 @@ pub(crate) struct Store {
 impl Store {
     /// Open (or create) the store at `cache_dir`, loading any existing index. A
     /// missing or unreadable index simply starts empty.
-    pub(crate) fn new(cache_dir: PathBuf) -> Self {
+    pub(crate) fn new(cache_dir: PathBuf, chunk_size: u64) -> Self {
         let index = File::open(cache_dir.join("index.json"))
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok())
             .unwrap_or_default();
         Store {
             dir: cache_dir,
+            chunk_size: chunk_size.max(1),
             temp_counter: AtomicU64::new(0),
             index: Mutex::new(index),
         }
@@ -173,34 +179,49 @@ impl Store {
         self.lock().listings.get(path.as_str()).cloned()
     }
 
-    /// Record `attrs` for `path`. If content was hydrated at a different
-    /// size/mtime, it is dropped so the next read re-hydrates (server wins).
+    /// Record `attrs` for `path`. If content was cached at a different
+    /// size/mtime, it is dropped so the next read re-fetches (server wins).
     pub(crate) fn put_attrs(&self, path: &RemotePath, attrs: &FileAttributes) {
         let mut index = self.lock();
         let stale = Self::store_attrs(&mut index, path.as_str(), attrs);
         Self::persist(&index, &self.dir);
         drop(index);
-        if let Some(object) = stale {
-            let _ = fs::remove_file(self.object_path(object));
-        }
+        self.remove_objects(stale);
     }
 
-    /// Update one entry's attributes in `index`, returning a now-orphaned content
-    /// object id if the version changed. Does not persist.
-    fn store_attrs(index: &mut Index, key: &str, attrs: &FileAttributes) -> Option<u64> {
-        let entry = index.entries.entry(key.to_string()).or_insert_with(|| Entry {
-            attrs: attrs.into(),
-            content: None,
-        });
+    /// Update one entry's attributes in `index`, returning now-orphaned content
+    /// object ids if the version changed. Does not persist.
+    fn store_attrs(index: &mut Index, key: &str, attrs: &FileAttributes) -> Vec<u64> {
+        let entry = index
+            .entries
+            .entry(key.to_string())
+            .or_insert_with(|| Entry {
+                attrs: attrs.into(),
+                content: None,
+            });
         entry.attrs = attrs.into();
         if let Some(content) = &entry.content
             && (content.size != attrs.size || content.modified != attrs.modified_unix_seconds)
         {
-            let object = content.object;
+            let objects = Self::content_objects(content);
             entry.content = None;
-            return Some(object);
+            return objects;
         }
-        None
+        Vec::new()
+    }
+
+    fn content_objects(content: &ContentRef) -> Vec<u64> {
+        content
+            .object
+            .into_iter()
+            .chain(content.chunks.values().copied())
+            .collect()
+    }
+
+    fn remove_objects(&self, objects: Vec<u64>) {
+        for object in objects {
+            let _ = fs::remove_file(self.object_path(object));
+        }
     }
 
     /// Record a directory listing: store each child's attributes and the parent's
@@ -215,17 +236,15 @@ impl Store {
         let mut orphans = Vec::new();
         for (name, attrs) in &children {
             if let Ok(child) = parent.join(name)
-                && let Some(object) = Self::store_attrs(&mut index, child.as_str(), attrs)
+                && let objects = Self::store_attrs(&mut index, child.as_str(), attrs)
             {
-                orphans.push(object);
+                orphans.extend(objects);
             }
         }
         index.listings.insert(parent.as_str().to_string(), names);
         Self::persist(&index, &self.dir);
         drop(index);
-        for object in orphans {
-            let _ = fs::remove_file(self.object_path(object));
-        }
+        self.remove_objects(orphans);
     }
 
     /// Forget a directory's cached child listing so the next `readdir` refetches.
@@ -246,7 +265,7 @@ impl Store {
         }
         drop(index);
         if let Some(content) = entry.and_then(|e| e.content) {
-            let _ = fs::remove_file(self.object_path(content.object));
+            self.remove_objects(Self::content_objects(&content));
         }
     }
 
@@ -273,35 +292,32 @@ impl Store {
             if let Some(entry) = index.entries.remove(&key)
                 && let Some(content) = entry.content
             {
-                orphans.push(content.object);
+                orphans.extend(Self::content_objects(&content));
             }
             index.listings.remove(&key);
         }
         Self::persist(&index, &self.dir);
         drop(index);
-        for object in orphans {
-            let _ = fs::remove_file(self.object_path(object));
-        }
+        self.remove_objects(orphans);
     }
 
     /// Drop just the cached content for `path` (e.g. after a write).
     pub(crate) fn invalidate_content(&self, path: &RemotePath) {
         let mut index = self.lock();
-        let object = index
+        let objects = index
             .entries
             .get_mut(path.as_str())
-            .and_then(|entry| entry.content.take().map(|c| c.object));
-        if object.is_some() {
+            .and_then(|entry| entry.content.take())
+            .map(|content| Self::content_objects(&content))
+            .unwrap_or_default();
+        if !objects.is_empty() {
             Self::persist(&index, &self.dir);
         }
         drop(index);
-        if let Some(object) = object {
-            let _ = fs::remove_file(self.object_path(object));
-        }
+        self.remove_objects(objects);
     }
 
-    /// Read a range, hydrating the whole file from `remote` if the cached copy is
-    /// missing or stale relative to `attrs`.
+    /// Read a range, fetching any missing 4 MiB chunks from `remote`.
     pub(crate) fn read(
         &self,
         path: &RemotePath,
@@ -310,65 +326,71 @@ impl Store {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
-        let object = {
-            let index = self.lock();
-            index
-                .entries
-                .get(path.as_str())
-                .and_then(|entry| entry.content.as_ref())
-                .filter(|c| c.size == attrs.size && c.modified == attrs.modified_unix_seconds)
-                .map(|c| c.object)
-        };
-        let object = match object {
-            Some(object) => object,
-            None => self.hydrate(path, remote, attrs)?,
-        };
-        self.read_object(object, offset, size)
+        if size == 0 || offset >= attrs.size {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(size as u64).min(attrs.size);
+        let chunk_range = chunk_range(offset, end, self.chunk_size);
+        for chunk in chunk_range.clone() {
+            if self.cached_chunk(path, attrs, chunk).is_none() {
+                self.fetch_chunk(path, remote, attrs, chunk)?;
+            }
+        }
+        self.read_cached_range(path, offset, end)
     }
 
     /// Read a range only if content is already hydrated; never contacts the
     /// remote (used in offline mode).
     pub(crate) fn read_cached(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let object = self
+        let size_on_server = self
             .lock()
             .entries
             .get(path.as_str())
-            .and_then(|entry| entry.content.as_ref().map(|c| c.object));
-        match object {
-            Some(object) => self.read_object(object, offset, size),
-            None => Err(Error::Unavailable(
+            .and_then(|entry| entry.content.as_ref())
+            .filter(|content| content.chunk_size == self.chunk_size)
+            .map(|content| content.size);
+        let Some(size_on_server) = size_on_server else {
+            return Err(Error::Unavailable(
                 "file contents are not cached and the mount is offline".to_string(),
-            )),
+            ));
+        };
+        if size == 0 || offset >= size_on_server {
+            return Ok(Vec::new());
         }
+        let end = offset.saturating_add(size as u64).min(size_on_server);
+        self.read_cached_range(path, offset, end)
     }
 
-    /// Download the whole file to a temp file, flush, atomically rename into the
-    /// objects dir, and record the content reference. Returns the object id.
-    fn hydrate(
+    fn cached_chunk(&self, path: &RemotePath, attrs: &FileAttributes, chunk: u64) -> Option<u64> {
+        self.lock()
+            .entries
+            .get(path.as_str())
+            .and_then(|entry| entry.content.as_ref())
+            .filter(|content| {
+                content.size == attrs.size && content.modified == attrs.modified_unix_seconds
+                    && content.chunk_size == self.chunk_size
+            })
+            .and_then(|content| content.chunks.get(&chunk).copied())
+    }
+
+    /// Download one chunk to a temp file, flush, atomically rename into the
+    /// objects dir, and record the chunk reference.
+    fn fetch_chunk(
         &self,
         path: &RemotePath,
         remote: &dyn RemoteFilesystem,
         attrs: &FileAttributes,
+        chunk: u64,
     ) -> Result<u64> {
         fs::create_dir_all(self.dir.join("objects")).map_err(cache_io)?;
         let temp_dir = self.dir.join("tmp");
         fs::create_dir_all(&temp_dir).map_err(cache_io)?;
 
-        // Reuse this path's object id if it has one, else allocate a new id.
         let object = {
             let mut index = self.lock();
-            match index
-                .entries
-                .get(path.as_str())
-                .and_then(|e| e.content.as_ref())
-            {
-                Some(content) => content.object,
-                None => {
-                    let id = index.next_object;
-                    index.next_object += 1;
-                    id
-                }
-            }
+            let id = index.next_object;
+            index.next_object += 1;
+            id
         };
 
         let temp = temp_dir.join(format!(
@@ -377,15 +399,17 @@ impl Store {
         ));
         let download = (|| -> Result<()> {
             let mut file = File::create(&temp).map_err(cache_io)?;
-            let mut offset = 0u64;
-            while offset < attrs.size {
-                let want = (attrs.size - offset).min(CHUNK as u64) as u32;
-                let chunk = remote.read(path, offset, want)?;
-                if chunk.is_empty() {
+            let chunk_start = chunk * self.chunk_size;
+            let chunk_len = (attrs.size - chunk_start).min(self.chunk_size);
+            let mut filled = 0u64;
+            while filled < chunk_len {
+                let want = (chunk_len - filled).min(u32::MAX as u64) as u32;
+                let data = remote.read(path, chunk_start + filled, want)?;
+                if data.is_empty() {
                     break;
                 }
-                file.write_all(&chunk).map_err(cache_io)?;
-                offset += chunk.len() as u64;
+                file.write_all(&data).map_err(cache_io)?;
+                filled += data.len() as u64;
             }
             file.sync_all().map_err(cache_io)
         })();
@@ -403,13 +427,62 @@ impl Store {
                 attrs: attrs.into(),
                 content: None,
             });
-        entry.content = Some(ContentRef {
-            object,
+        let content = entry.content.get_or_insert_with(|| ContentRef {
             size: attrs.size,
             modified: attrs.modified_unix_seconds,
+            chunk_size: self.chunk_size,
+            chunks: HashMap::new(),
+            object: None,
         });
+        if content.size != attrs.size
+            || content.modified != attrs.modified_unix_seconds
+            || content.chunk_size != self.chunk_size
+        {
+            for old_object in Self::content_objects(content) {
+                let _ = fs::remove_file(self.object_path(old_object));
+            }
+            content.chunks.clear();
+            content.object = None;
+        }
+        content.size = attrs.size;
+        content.modified = attrs.modified_unix_seconds;
+        content.chunk_size = self.chunk_size;
+        if let Some(old_object) = content.chunks.insert(chunk, object) {
+            let _ = fs::remove_file(self.object_path(old_object));
+        }
         Self::persist(&index, &self.dir);
         Ok(object)
+    }
+
+    fn read_cached_range(&self, path: &RemotePath, offset: u64, end: u64) -> Result<Vec<u8>> {
+        let chunks = {
+            let index = self.lock();
+            let Some(content) = index
+                .entries
+                .get(path.as_str())
+                .and_then(|e| e.content.as_ref())
+                .filter(|content| content.chunk_size == self.chunk_size)
+            else {
+                return Err(Error::Unavailable(
+                    "file contents are not cached and the mount is offline".to_string(),
+                ));
+            };
+            content.chunks.clone()
+        };
+
+        let mut data = Vec::with_capacity((end - offset) as usize);
+        for chunk in chunk_range(offset, end, self.chunk_size) {
+            let object = chunks.get(&chunk).copied().ok_or_else(|| {
+                Error::Unavailable(
+                    "file contents are not cached and the mount is offline".to_string(),
+                )
+            })?;
+            let chunk_start = chunk * self.chunk_size;
+            let read_start = offset.max(chunk_start) - chunk_start;
+            let read_end = end.min(chunk_start + self.chunk_size) - chunk_start;
+            data.extend(self.read_object(object, read_start, (read_end - read_start) as u32)?);
+        }
+        Ok(data)
     }
 
     fn read_object(&self, object: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
@@ -428,6 +501,11 @@ impl Store {
         buffer.truncate(filled);
         Ok(buffer)
     }
+}
+
+fn chunk_range(offset: u64, end: u64, chunk_size: u64) -> std::ops::RangeInclusive<u64> {
+    let chunk_size = chunk_size.max(1);
+    (offset / chunk_size)..=((end - 1) / chunk_size)
 }
 
 #[cfg(test)]
@@ -484,10 +562,63 @@ mod tests {
         }
     }
 
+    struct SparseRemote {
+        size: u64,
+        reads: Mutex<Vec<(u64, u32)>>,
+    }
+
+    impl SparseRemote {
+        fn new(size: u64) -> Self {
+            Self {
+                size,
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<(u64, u32)> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl RemoteFilesystem for SparseRemote {
+        fn read(&self, _: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
+            self.reads.lock().unwrap().push((offset, size));
+            let available = self.size.saturating_sub(offset).min(size as u64) as usize;
+            Ok(vec![b'x'; available])
+        }
+        fn stat(&self, _: &RemotePath) -> Result<FileAttributes> {
+            unreachable!()
+        }
+        fn read_dir(&self, _: &RemotePath) -> Result<Vec<crate::RemoteDirectoryEntry>> {
+            unreachable!()
+        }
+        fn write(&self, _: &RemotePath, _: u64, _: &[u8]) -> Result<u32> {
+            unreachable!()
+        }
+        fn create(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+            unreachable!()
+        }
+        fn mkdir(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+            unreachable!()
+        }
+        fn unlink(&self, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn rmdir(&self, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn rename(&self, _: &RemotePath, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn setattr(&self, _: &RemotePath, _: crate::SetAttributes) -> Result<FileAttributes> {
+            unreachable!()
+        }
+    }
+
     #[test]
     fn read_cached_missing_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(dir.path().to_path_buf());
+        let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
         assert!(matches!(
             store.read_cached(&RemotePath::new("/x").unwrap(), 0, 8),
             Err(Error::Unavailable(_))
@@ -501,7 +632,7 @@ mod tests {
         let attrs = file_attrs(5, 100);
 
         {
-            let store = Store::new(dir.path().to_path_buf());
+            let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
             store.put_attrs(&path, &attrs);
             store
                 .read(&path, &BytesRemote(b"hello".to_vec()), &attrs, 0, 16)
@@ -509,20 +640,61 @@ mod tests {
         }
 
         // Reopen: metadata and content are still available without any remote.
-        let store = Store::new(dir.path().to_path_buf());
+        let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
         assert_eq!(store.get_attrs(&path).unwrap().size, 5);
         assert_eq!(store.read_cached(&path, 0, 16).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn read_fetches_only_needed_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf(), 1024);
+        let path = RemotePath::new("/video.mkv").unwrap();
+        let attrs = file_attrs(1024 * 3, 100);
+        let remote = SparseRemote::new(attrs.size);
+
+        assert_eq!(
+            store.read(&path, &remote, &attrs, 0, 1024).unwrap().len(),
+            1024
+        );
+        assert_eq!(remote.reads(), vec![(0, 1024)]);
+
+        remote.reads.lock().unwrap().clear();
+        assert_eq!(
+            store
+                .read(&path, &remote, &attrs, 1024 + 128, 1024)
+                .unwrap()
+                .len(),
+            1024
+        );
+        assert_eq!(remote.reads(), vec![(1024, 1024), (2048, 1024)]);
+
+        remote.reads.lock().unwrap().clear();
+        assert_eq!(
+            store.read(&path, &remote, &attrs, 0, 1024).unwrap().len(),
+            1024
+        );
+        assert!(
+            remote.reads().is_empty(),
+            "cached chunk should not be refetched"
+        );
     }
 
     #[test]
     fn newer_server_version_drops_stale_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = RemotePath::new("/a.txt").unwrap();
-        let store = Store::new(dir.path().to_path_buf());
+        let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
 
         store.put_attrs(&path, &file_attrs(5, 100));
         store
-            .read(&path, &BytesRemote(b"hello".to_vec()), &file_attrs(5, 100), 0, 16)
+            .read(
+                &path,
+                &BytesRemote(b"hello".to_vec()),
+                &file_attrs(5, 100),
+                0,
+                16,
+            )
             .unwrap();
         assert_eq!(store.read_cached(&path, 0, 16).unwrap(), b"hello");
 
@@ -539,7 +711,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent = RemotePath::root();
         {
-            let store = Store::new(dir.path().to_path_buf());
+            let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
             store.record_listing(
                 &parent,
                 vec![
@@ -548,9 +720,15 @@ mod tests {
                 ],
             );
         }
-        let store = Store::new(dir.path().to_path_buf());
+        let store = Store::new(dir.path().to_path_buf(), crate::DEFAULT_CACHE_CHUNK_SIZE);
         let children = store.get_children(&parent).unwrap();
         assert_eq!(children, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(store.get_attrs(&RemotePath::new("/a").unwrap()).unwrap().size, 1);
+        assert_eq!(
+            store
+                .get_attrs(&RemotePath::new("/a").unwrap())
+                .unwrap()
+                .size,
+            1
+        );
     }
 }

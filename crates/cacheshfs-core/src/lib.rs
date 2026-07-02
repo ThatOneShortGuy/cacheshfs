@@ -12,8 +12,11 @@ pub struct MountConfig {
     pub mountpoint: PathBuf,
     pub cache_dir: PathBuf,
     pub cache_mode: CacheMode,
+    pub cache_chunk_size: u64,
     pub read_only: bool,
 }
+
+pub const DEFAULT_CACHE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {

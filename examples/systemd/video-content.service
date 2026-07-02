@@ -1,0 +1,29 @@
+# User systemd unit for mounting worker@thebrown.us:/mnt/video-content
+# at ~/video-content in read-only mode.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/systemd/video-content.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now video-content.service
+#
+# Before enabling, make sure worker@thebrown.us is reachable non-interactively:
+# the host key should already be in ~/.ssh/known_hosts and the SSH key should
+# not require an interactive passphrase prompt.
+
+[Unit]
+Description=cacheshfs read-only mount of worker@thebrown.us:/mnt/video-content
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# FUSE requires the mountpoint to exist as a directory before mounting.
+ExecStartPre=/bin/mkdir -p %h/video-content
+ExecStart=/home/braxton/cacheshfs/target/release/cacheshfs --read-only --cache-mode on-demand worker@thebrown.us:/mnt/video-content %h/video-content
+ExecStop=/bin/fusermount -u %h/video-content
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -6,7 +6,7 @@
 //! [`RemoteFilesystem`].
 //!
 //! **Metadata + content caching:** metadata (`getattr`/`lookup`/`readdir`) and
-//! whole-file content are cached in a persistent, path-keyed [`Store`] under
+//! file content chunks are cached in a persistent, path-keyed [`Store`] under
 //! `cache_dir`, so a previously cached tree survives a restart and can be served
 //! offline. An in-memory per-session freshness map applies a TTL for online
 //! revalidation and a short-TTL negative-lookup cache; in [`CacheMode::Offline`]
@@ -116,6 +116,7 @@ impl CacheVfs {
         cache_mode: CacheMode,
         metadata_ttl: Duration,
         cache_dir: PathBuf,
+        cache_chunk_size: u64,
     ) -> Self {
         let mut path_to_node = HashMap::new();
         let mut node_to_path = HashMap::new();
@@ -128,7 +129,7 @@ impl CacheVfs {
             cache_mode,
             metadata_ttl,
             negative_ttl: metadata_ttl.min(NEGATIVE_TTL_CAP),
-            store: Store::new(cache_dir),
+            store: Store::new(cache_dir, cache_chunk_size),
             state: Mutex::new(State {
                 next_node: NodeId::ROOT.0 + 1,
                 next_handle: 1,
@@ -150,6 +151,7 @@ impl CacheVfs {
         read_only: bool,
         metadata_ttl: Duration,
         cache_dir: PathBuf,
+        cache_chunk_size: u64,
     ) -> Self {
         Self::new(
             Arc::new(DisconnectedRemote),
@@ -158,6 +160,7 @@ impl CacheVfs {
             CacheMode::Offline,
             metadata_ttl,
             cache_dir,
+            cache_chunk_size,
         )
     }
 
@@ -940,6 +943,7 @@ mod tests {
             CacheMode::Remote,
             LONG_TTL,
             fresh_cache_dir(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         )
     }
 
@@ -951,6 +955,7 @@ mod tests {
             CacheMode::Remote,
             LONG_TTL,
             fresh_cache_dir(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         )
     }
 
@@ -964,6 +969,7 @@ mod tests {
             mode,
             ttl,
             fresh_cache_dir(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         );
         (vfs, remote)
     }
@@ -980,6 +986,7 @@ mod tests {
             mode,
             ttl,
             dir.path().to_path_buf(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         );
         (vfs, remote, dir)
     }
@@ -1589,6 +1596,7 @@ mod tests {
                 CacheMode::OnDemand,
                 LONG_TTL,
                 dir.path().to_path_buf(),
+                crate::DEFAULT_CACHE_CHUNK_SIZE,
             );
             let (_node, handle) = open_for_read(&vfs, "readme.txt");
             assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
@@ -1604,6 +1612,7 @@ mod tests {
             CacheMode::Offline,
             LONG_TTL,
             dir.path().to_path_buf(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         );
         let node = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
         let handle = vfs
@@ -1630,6 +1639,7 @@ mod tests {
             CacheMode::Offline,
             LONG_TTL,
             dir.path().to_path_buf(),
+            crate::DEFAULT_CACHE_CHUNK_SIZE,
         );
         assert!(matches!(
             vfs.lookup(NodeId::ROOT, "readme.txt"),
