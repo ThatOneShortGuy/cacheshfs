@@ -254,6 +254,7 @@ dependencies = [
  "cacheshfs-sftp",
  "cacheshfs-windows",
  "clap",
+ "tempfile",
  "winfsp",
 ]
 

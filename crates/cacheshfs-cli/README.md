@@ -16,8 +16,8 @@ cacheshfs [OPTIONS] [user@]host:/remote/path <mountpoint>
 - positional remote `[user@]host:/remote/path` and `mountpoint`
 - `--cache-dir`, `--cache-mode`, `--read-only` → `MountConfig`
 - `--metadata-ttl` (e.g. `30s`, `5m`) → metadata cache TTL in `CacheVfs`
-- `--port`, `--identity-file`, `--accept-unknown-host-key` → SFTP connection
-  (`SftpConnectOptions`)
+- `--port`, `--identity-file`, `--accept-unknown-host-key`, `--ssh-config` →
+  SFTP connection (`SftpConnectOptions`)
 
 By default, connecting to a host absent from `known_hosts` shows an OpenSSH-style
 trust-on-first-use prompt (displays the key fingerprint; on `yes` the key is
@@ -26,12 +26,22 @@ rejected. With no terminal available the connection is refused rather than
 hanging. `--accept-unknown-host-key` skips the prompt and blindly trusts unknown
 hosts (insecure).
 
+### SSH config
+
+The host alias in the remote spec is resolved against an OpenSSH client config —
+`--ssh-config <path>`, or `~/.ssh/config` by default when it exists. Matching
+`Host` blocks (with `*`/`?`/`!` patterns) supply `HostName`, `User`, `Port`, and
+`IdentityFile`, so `cacheshfs server:/srv X:` uses the connection details of your
+configured `server` host. An explicit `user@`, `--port`, or `--identity-file`
+overrides the config, matching OpenSSH precedence. `Match` blocks are not
+evaluated. A missing default `~/.ssh/config` is ignored; a `--ssh-config` path
+that does not exist is an error.
+
 ## Accepted but not yet applied
 
 These are parsed (so `--help` is complete and forward-compatible) but warn when
 supplied, pending support in the core/transport layers:
 
-- `--ssh-config` (OpenSSH config parsing)
 - `--content-ttl` (content cache — not yet implemented)
 - `--download` (prefetch — not yet implemented)
 - `--allow-other` (FUSE passthrough)

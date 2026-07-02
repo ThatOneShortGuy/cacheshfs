@@ -4,6 +4,7 @@
 //! [`CacheVfs`] over it, and dispatches to the platform [`MountBackend`].
 
 mod cli;
+mod ssh_config;
 
 use std::process::ExitCode;
 use std::sync::Arc;

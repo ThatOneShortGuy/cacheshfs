@@ -1,12 +1,15 @@
 //! Command-line argument parsing and translation into a [`MountConfig`].
 
 use std::env;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cacheshfs_core::{CacheMode, MountConfig, RemoteConfig};
 use cacheshfs_sftp::{SftpConnectOptions, SftpTarget};
 use clap::{Parser, ValueEnum};
+
+use crate::ssh_config;
 
 /// Mount a remote directory over SSH with an optional local cache.
 #[derive(Debug, Parser)]
@@ -53,7 +56,9 @@ pub struct Cli {
     #[arg(long)]
     pub accept_unknown_host_key: bool,
 
-    /// SSH config file.
+    /// OpenSSH client config to resolve the host alias against (its `HostName`,
+    /// `User`, `Port`, and `IdentityFile`). Defaults to `~/.ssh/config` if that
+    /// file exists; explicit command-line values still take precedence.
     #[arg(long, value_name = "PATH")]
     pub ssh_config: Option<PathBuf>,
 
@@ -101,9 +106,6 @@ impl Cli {
     /// ignore them.
     pub fn unwired_options(&self) -> Vec<&'static str> {
         let mut names = Vec::new();
-        if self.ssh_config.is_some() {
-            names.push("--ssh-config");
-        }
         if self.content_ttl.is_some() {
             names.push("--content-ttl");
         }
@@ -153,22 +155,75 @@ impl Cli {
     }
 
     /// Build the SFTP connection options for `target` (the `[user@]host` part of
-    /// the remote spec), applying the `--port`, `--identity-file`, and
-    /// `--accept-unknown-host-key` flags on top of the transport defaults.
+    /// the remote spec).
+    ///
+    /// The matching `~/.ssh/config` block (or `--ssh-config` file) supplies
+    /// defaults for the host alias — `HostName`, `User`, `Port`, and
+    /// `IdentityFile` — and the `--port`, `--identity-file`, and an explicit
+    /// `user@` in the target override them, matching OpenSSH precedence.
     pub fn connect_options(&self, target: &str) -> Result<SftpConnectOptions, String> {
+        // The alias is the host as written on the command line, before ssh
+        // config rewrites it; an explicit `user@` pins the username.
+        let (explicit_user, alias) = match target.rsplit_once('@') {
+            Some((user, host)) if !user.is_empty() => (Some(user), host),
+            _ => (None, target),
+        };
+        let host_config = self.resolve_ssh_config(alias)?;
+
         let mut sftp_target = SftpTarget::parse(target).map_err(|error| error.to_string())?;
+        // HostName from ssh config points the alias at a real host.
+        if let Some(hostname) = &host_config.hostname {
+            sftp_target.host = hostname.clone();
+        }
+        // ssh config User applies only when the target did not pin one.
+        if explicit_user.is_none()
+            && let Some(user) = &host_config.user
+        {
+            sftp_target.username = user.clone();
+        }
+        // Port precedence: --port, then ssh config Port, then the default.
         if let Some(port) = self.port {
+            sftp_target.port = port;
+        } else if let Some(port) = host_config.port {
             sftp_target.port = port;
         }
 
         let mut options = SftpConnectOptions::for_target(sftp_target);
+        // Identity precedence: --identity-file first, then any from ssh config.
         if let Some(identity_file) = &self.identity_file {
             options = options.with_identity_file(identity_file.clone());
+        }
+        for identity_file in host_config.identity_files {
+            options = options.with_identity_file(identity_file);
         }
         if self.accept_unknown_host_key {
             options = options.accept_unknown_hosts(true);
         }
         Ok(options)
+    }
+
+    /// Resolve the ssh-config settings for `alias`. Reads `--ssh-config` when
+    /// given (a missing file is an error), otherwise `~/.ssh/config` when it
+    /// exists (a missing default file is silently ignored).
+    fn resolve_ssh_config(&self, alias: &str) -> Result<ssh_config::SshHostConfig, String> {
+        let (path, required) = match &self.ssh_config {
+            Some(path) => (path.clone(), true),
+            None => match ssh_config::default_config_path() {
+                Some(path) => (path, false),
+                None => return Ok(ssh_config::SshHostConfig::default()),
+            },
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(ssh_config::resolve(&text, alias)),
+            Err(error) if error.kind() == ErrorKind::NotFound && !required => {
+                Ok(ssh_config::SshHostConfig::default())
+            }
+            Err(error) => Err(format!(
+                "failed to read ssh config '{}': {error}",
+                path.display()
+            )),
+        }
     }
 }
 
@@ -445,14 +500,16 @@ mod parse_tests {
         assert!(bare.unwired_options().is_empty());
 
         let with_extras =
-            parse(&["cacheshfs", "host:/srv", "/mnt", "--ssh-config", "/c", "--allow-other"])
+            parse(&["cacheshfs", "host:/srv", "/mnt", "--download", "/d", "--allow-other"])
                 .unwrap();
         let reported = with_extras.unwired_options();
-        assert!(reported.contains(&"--ssh-config"));
+        assert!(reported.contains(&"--download"));
         assert!(reported.contains(&"--allow-other"));
-        // --port and --identity-file are now wired into the SFTP connection.
+        // --port, --identity-file, and --ssh-config are now wired into the
+        // SFTP connection.
         assert!(!reported.contains(&"--port"));
         assert!(!reported.contains(&"--identity-file"));
+        assert!(!reported.contains(&"--ssh-config"));
     }
 
     #[test]
@@ -470,8 +527,20 @@ mod parse_tests {
         assert!(cli.unwired_options().is_empty());
     }
 
+    /// Write ssh-config `contents` to a temp file and return the dir (kept
+    /// alive by the caller) plus the path to pass as `--ssh-config`. Tests use
+    /// this so they never read the developer's real `~/.ssh/config`.
+    fn config_file(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, contents).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        (dir, path)
+    }
+
     #[test]
     fn connect_options_apply_port_and_identity() {
+        let (_dir, config) = config_file("");
         let cli = parse(&[
             "cacheshfs",
             "alice@host:/srv",
@@ -480,6 +549,8 @@ mod parse_tests {
             "2222",
             "--identity-file",
             "/keys/id_ed25519",
+            "--ssh-config",
+            &config,
         ])
         .unwrap();
         let options = cli.connect_options("alice@host").unwrap();
@@ -493,15 +564,68 @@ mod parse_tests {
 
     #[test]
     fn connect_options_accept_unknown_host_key() {
+        let (_dir, config) = config_file("");
         let cli = parse(&[
             "cacheshfs",
             "alice@host:/srv",
             "/mnt",
             "--accept-unknown-host-key",
+            "--ssh-config",
+            &config,
         ])
         .unwrap();
         let options = cli.connect_options("alice@host").unwrap();
         assert!(options.accept_unknown_hosts);
+    }
+
+    #[test]
+    fn ssh_config_resolves_host_alias() {
+        let (_dir, config) = config_file(
+            "Host server\n    HostName home.example.com\n    User braxton\n    Port 2222\n    IdentityFile /keys/server_ed25519\n",
+        );
+        let cli = parse(&["cacheshfs", "server:/srv", "/mnt", "--ssh-config", &config]).unwrap();
+        let options = cli.connect_options("server").unwrap();
+        assert_eq!(options.target.host, "home.example.com");
+        assert_eq!(options.target.username, "braxton");
+        assert_eq!(options.target.port, 2222);
+        assert!(options
+            .identity_files
+            .contains(&PathBuf::from("/keys/server_ed25519")));
+    }
+
+    #[test]
+    fn explicit_values_override_ssh_config() {
+        let (_dir, config) = config_file(
+            "Host server\n    HostName home.example.com\n    User braxton\n    Port 2222\n",
+        );
+        // An explicit user@ and --port beat the config; HostName still applies.
+        let cli = parse(&[
+            "cacheshfs",
+            "root@server:/srv",
+            "/mnt",
+            "--port",
+            "2200",
+            "--ssh-config",
+            &config,
+        ])
+        .unwrap();
+        let options = cli.connect_options("root@server").unwrap();
+        assert_eq!(options.target.host, "home.example.com");
+        assert_eq!(options.target.username, "root");
+        assert_eq!(options.target.port, 2200);
+    }
+
+    #[test]
+    fn missing_explicit_ssh_config_is_an_error() {
+        let cli = parse(&[
+            "cacheshfs",
+            "server:/srv",
+            "/mnt",
+            "--ssh-config",
+            "/no/such/ssh/config",
+        ])
+        .unwrap();
+        assert!(cli.connect_options("server").is_err());
     }
 
     #[test]
