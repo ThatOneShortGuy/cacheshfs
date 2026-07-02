@@ -67,14 +67,16 @@ pub struct Cli {
     pub metadata_ttl: Option<String>,
 
     /// How long clean cached file contents are trusted before revalidation.
+    /// [not yet implemented]
     #[arg(long, value_name = "DURATION")]
     pub content_ttl: Option<String>,
 
-    /// Prefetch a remote path into the cache.
+    /// Prefetch a remote path into the cache. [not yet implemented]
     #[arg(long, value_name = "PATH")]
     pub download: Option<String>,
 
     /// Pass through FUSE allow-other behavior when permitted by the system.
+    /// [not yet implemented]
     #[arg(long)]
     pub allow_other: bool,
 }
