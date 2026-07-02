@@ -39,12 +39,21 @@ if (-not (Test-Path $devShell)) {
 }
 
 # Import the MSVC/SDK environment (INCLUDE, LIB, PATH, ...) into this session.
-# -SkipAutomaticLocation keeps our working directory; the script may emit a
-# benign 'vswhere.exe not recognized' note that does not affect the result.
-& $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
+# -SkipAutomaticLocation keeps our working directory. All streams are discarded:
+# the script emits a benign 'vswhere.exe not recognized' note internally that
+# does not affect the result.
+& $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation *> $null
 
 Set-Location $PSScriptRoot
 
-$cargoArgs = if ($args.Count -gt 0) { $args } else { @('build') }
-& cargo @cargoArgs
+# Hand off to cargo. Splat $args (always a real array) when the caller passed
+# arguments; otherwise default to `cargo build`. Note: do NOT funnel the default
+# through a variable like `$a = @('build'); cargo @a` — PowerShell unwraps the
+# single-element array to the scalar string "build", and splatting a string
+# enumerates its characters, so cargo would receive `b u i l d`.
+if ($args.Count -gt 0) {
+    & cargo @args
+} else {
+    & cargo build
+}
 exit $LASTEXITCODE
