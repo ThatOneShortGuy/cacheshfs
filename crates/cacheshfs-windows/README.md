@@ -48,5 +48,6 @@ backend to mount yet. Once they land, the manual smoke test is:
 
 1. Run the CLI to mount onto a drive letter (e.g. `Z:`) or directory.
 2. `dir Z:\`, open/read a file, create/write/delete, rename.
-3. Unmount (currently by terminating the process — graceful shutdown signalling
-   is a TODO in `mount.rs`).
+3. Unmount with `Ctrl-C`: `mount.rs` installs a signal handler that drops the
+   `FileSystemHost`, whose `Drop` calls `unmount()` + `stop()` for a clean
+   teardown.

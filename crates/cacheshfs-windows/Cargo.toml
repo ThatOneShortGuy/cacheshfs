@@ -10,6 +10,7 @@ cacheshfs-core.workspace = true
 # non-Windows hosts (where everything in this crate falls back to a stub).
 [target.'cfg(windows)'.dependencies]
 winfsp = "0.13"
+ctrlc = "3"
 
 # `winfsp::build::winfsp_link_delayload()` (used in build.rs) lives behind the
 # `delayload` feature, which is part of winfsp's default `full` feature set.

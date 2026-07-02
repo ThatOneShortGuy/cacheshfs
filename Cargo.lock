@@ -302,6 +302,7 @@ name = "cacheshfs-windows"
 version = "0.1.0"
 dependencies = [
  "cacheshfs-core",
+ "ctrlc",
  "winfsp",
 ]
 

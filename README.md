@@ -103,13 +103,15 @@ Run `cacheshfs --help` for full option descriptions.
 
 ## Unmounting
 
-Stop the `cacheshfs` process to unmount. On Linux, `Ctrl-C` (SIGINT) or SIGTERM
-triggers a clean unmount; you can also unmount from another terminal with
+`Ctrl-C` (SIGINT/SIGTERM) triggers a clean unmount on both platforms — on Linux
+via `umount_and_join`, on Windows by dropping the WinFsp host (which unmounts and
+stops the dispatcher). On Linux you can also unmount from another terminal with
 `fusermount -u <mountpoint>`, which ends the process.
 
-If the process is killed abruptly (e.g. `kill -9`, a crash, or a closed terminal
-before the signal is handled), the mountpoint can be left stale — any access
-reports `Transport endpoint is not connected`. Do **not** `rm` it; unmount it:
+If a Linux process is killed abruptly (e.g. `kill -9`, a crash, or a closed
+terminal before the signal is handled), the mountpoint can be left stale — any
+access reports `Transport endpoint is not connected`. Do **not** `rm` it;
+unmount it:
 
 ```sh
 fusermount -u <mountpoint>      # fuse2
@@ -120,6 +122,10 @@ fusermount -uz <mountpoint>     # lazy unmount if it says "target is busy"
 
 Then the mountpoint is a normal empty directory again and `rmdir <mountpoint>`
 works.
+
+On Windows this is rarely needed: WinFsp tears the volume down when the owning
+process exits, so even an abrupt kill usually leaves no stale mount. If a drive
+letter does linger, `net use <drive> /delete` clears it.
 
 ## Automounting on Linux at boot
 

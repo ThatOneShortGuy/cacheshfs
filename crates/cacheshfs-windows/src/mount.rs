@@ -2,6 +2,8 @@
 //! dispatcher.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use cacheshfs_core::{Error, MountConfig, Result, VirtualFilesystem};
 use winfsp::host::{FileSystemHost, VolumeParams};
@@ -54,13 +56,21 @@ pub fn mount(config: MountConfig, filesystem: Arc<dyn VirtualFilesystem>) -> Res
     host.start()
         .map_err(|e| Error::MountBackend(format!("failed to start WinFsp dispatcher: {e}")))?;
 
-    // `start` returns immediately; the dispatcher runs on its own threads. Keep
-    // this thread (and therefore `host`, whose Drop unmounts) alive until the
-    // process exits.
-    //
-    // TODO: wire a shutdown signal (e.g. Ctrl-C or an unmount command) that
-    // calls `host.stop()` so the mount can be torn down gracefully.
-    loop {
-        std::thread::park();
+    // `start` returns immediately; the dispatcher runs on its own threads. Wait
+    // here until Ctrl-C / termination flips the flag, then fall out of the
+    // function so `host` drops — its Drop calls `unmount()` + `stop()`, tearing
+    // the mount down gracefully instead of leaving the process to be killed.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        ctrlc::set_handler(move || shutdown.store(true, Ordering::SeqCst))
+            .map_err(|e| Error::MountBackend(format!("failed to install signal handler: {e}")))?;
     }
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    eprintln!("cacheshfs: unmounting {}", config.mountpoint.display());
+    Ok(())
 }
