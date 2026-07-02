@@ -101,6 +101,26 @@ Run `cacheshfs --help` for full option descriptions.
 | `pinned` | Currently behaves like `on-demand` (a keep-resident/prefetch policy is not yet implemented). |
 | `offline` | Serve only from the persistent cache; never connect. Uncached paths report not-found and writes are rejected. |
 
+## Unmounting
+
+Stop the `cacheshfs` process to unmount. On Linux, `Ctrl-C` (SIGINT) or SIGTERM
+triggers a clean unmount; you can also unmount from another terminal with
+`fusermount -u <mountpoint>`, which ends the process.
+
+If the process is killed abruptly (e.g. `kill -9`, a crash, or a closed terminal
+before the signal is handled), the mountpoint can be left stale — any access
+reports `Transport endpoint is not connected`. Do **not** `rm` it; unmount it:
+
+```sh
+fusermount -u <mountpoint>      # fuse2
+fusermount3 -u <mountpoint>     # fuse3, if the above is not found
+sudo umount <mountpoint>        # fallback
+fusermount -uz <mountpoint>     # lazy unmount if it says "target is busy"
+```
+
+Then the mountpoint is a normal empty directory again and `rmdir <mountpoint>`
+works.
+
 ## Workspace layout
 
 | Crate | Role |
