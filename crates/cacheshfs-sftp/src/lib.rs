@@ -11,6 +11,7 @@ use std::future::Future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cacheshfs_core::{
     Error, FileAttributes, FileKind, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result,
@@ -25,12 +26,16 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes as SftpAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
+use tokio::time::timeout;
+
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SftpBackend {
     // Kept alive to hold the SSH connection open; field-drop order is
     // declaration order, so the runtime (last) outlives the session/handle.
     _handle: Handle<ClientHandler>,
     sftp: SftpSession,
+    read_timeout: Duration,
     runtime: Runtime,
 }
 
@@ -51,6 +56,7 @@ pub struct SftpConnectOptions {
     pub use_agent: bool,
     pub identity_files: Vec<PathBuf>,
     pub passphrase: Option<String>,
+    pub read_timeout: Duration,
 }
 
 impl SftpBackend {
@@ -75,6 +81,7 @@ impl SftpBackend {
         Ok(Self {
             _handle: handle,
             sftp,
+            read_timeout: options.read_timeout,
             runtime,
         })
     }
@@ -108,6 +115,7 @@ impl SftpConnectOptions {
             use_agent: true,
             identity_files: default_identity_files(),
             passphrase: None,
+            read_timeout: DEFAULT_READ_TIMEOUT,
         }
     }
 
@@ -128,6 +136,11 @@ impl SftpConnectOptions {
 
     pub fn with_passphrase(mut self, passphrase: impl Into<String>) -> Self {
         self.passphrase = Some(passphrase.into());
+        self
+    }
+
+    pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
         self
     }
 }
@@ -157,22 +170,31 @@ impl RemoteFilesystem for SftpBackend {
     fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
         let path = path.as_str().to_string();
         self.runtime.block_on(async {
-            let mut file = self.sftp.open(path).await.map_err(map_sftp_error)?;
-            file.seek(SeekFrom::Start(offset))
-                .await
-                .map_err(map_io_error)?;
+            timeout(self.read_timeout, async {
+                let mut file = self.sftp.open(path).await.map_err(map_sftp_error)?;
+                file.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(map_io_error)?;
 
-            let mut buffer = vec![0u8; size as usize];
-            let mut filled = 0;
-            while filled < buffer.len() {
-                let read = file.read(&mut buffer[filled..]).await.map_err(map_io_error)?;
-                if read == 0 {
-                    break;
+                let mut buffer = vec![0u8; size as usize];
+                let mut filled = 0;
+                while filled < buffer.len() {
+                    let read = file.read(&mut buffer[filled..]).await.map_err(map_io_error)?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
                 }
-                filled += read;
-            }
-            buffer.truncate(filled);
-            Ok(buffer)
+                buffer.truncate(filled);
+                Ok(buffer)
+            })
+            .await
+            .map_err(|_| {
+                Error::Unavailable(format!(
+                    "remote read timed out after {}s",
+                    self.read_timeout.as_secs()
+                ))
+            })?
         })
     }
 

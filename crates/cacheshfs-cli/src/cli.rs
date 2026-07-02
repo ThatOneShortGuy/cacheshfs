@@ -70,6 +70,10 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub metadata_ttl: Option<String>,
 
+    /// Maximum time to wait for one remote file read before returning an error.
+    #[arg(long, value_name = "DURATION")]
+    pub remote_read_timeout: Option<String>,
+
     /// How long clean cached file contents are trusted before revalidation.
     /// [not yet implemented]
     #[arg(long, value_name = "DURATION")]
@@ -224,6 +228,9 @@ impl Cli {
         }
         if self.accept_unknown_host_key {
             options = options.accept_unknown_hosts(true);
+        }
+        if let Some(timeout) = &self.remote_read_timeout {
+            options = options.with_read_timeout(parse_duration(timeout)?);
         }
         Ok(options)
     }
@@ -435,6 +442,7 @@ mod tests {
             accept_unknown_host_key: false,
             ssh_config: None,
             metadata_ttl: None,
+            remote_read_timeout: None,
             content_ttl: None,
             download: None,
             allow_other: false,
@@ -456,6 +464,7 @@ mod tests {
             accept_unknown_host_key: false,
             ssh_config: None,
             metadata_ttl: None,
+            remote_read_timeout: None,
             content_ttl: None,
             download: None,
             allow_other: false,
@@ -488,6 +497,7 @@ mod parse_tests {
         assert!(!cli.read_only);
         assert!(cli.cache_dir.is_none());
         assert!(cli.port.is_none());
+        assert!(cli.remote_read_timeout.is_none());
         assert!(!cli.allow_other);
     }
 
@@ -512,6 +522,8 @@ mod parse_tests {
             "/home/alice/.ssh/config",
             "--metadata-ttl",
             "30s",
+            "--remote-read-timeout",
+            "5s",
             "--content-ttl",
             "5m",
             "--download",
@@ -526,6 +538,7 @@ mod parse_tests {
         assert!(cli.read_only);
         assert_eq!(cli.port, Some(2222));
         assert_eq!(cli.metadata_ttl.as_deref(), Some("30s"));
+        assert_eq!(cli.remote_read_timeout.as_deref(), Some("5s"));
         assert_eq!(cli.content_ttl.as_deref(), Some("5m"));
         assert_eq!(cli.download.as_deref(), Some("/srv/data/big"));
         assert!(cli.allow_other);
