@@ -3,7 +3,9 @@
 Command-line entrypoint.
 
 Parses arguments, builds a `MountConfig`, connects the SFTP transport, wraps it
-in the shared `CacheVfs`, and dispatches to the platform `MountBackend`.
+in the shared `CacheVfs`, and dispatches to the platform `MountBackend`. With
+`--cache-mode offline` it skips the connection entirely and serves from the
+persistent cache (see below).
 
 ```text
 cacheshfs [OPTIONS] [user@]host:/remote/path <mountpoint>
@@ -36,7 +38,13 @@ supplied, pending support in the core/transport layers:
 
 ## Notes
 
-- `CacheVfs` supports read and write-through, plus an in-memory metadata cache
-  (`--metadata-ttl`). On-disk content caching is a later layer.
+- `CacheVfs` supports read and write-through, a metadata cache
+  (`--metadata-ttl`), and an on-disk content cache under `--cache-dir`. The cache
+  is persistent: metadata, directory listings, and hydrated file content survive
+  a restart, so relaunching against the same `--cache-dir` reuses it.
+- `--cache-mode offline` mounts without any connection and serves the previously
+  cached tree; uncached paths report not-found and writes are rejected. On
+  reconnect (any online mode) the server is authoritative — content that differs
+  from the remote is dropped and re-fetched.
 - On Windows the binary delay-loads WinFsp (see `build.rs`); the WinFsp runtime
   must be installed for an actual mount.

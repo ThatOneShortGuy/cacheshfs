@@ -5,19 +5,16 @@
 //! and an in-memory metadata cache, and forwards operations to a
 //! [`RemoteFilesystem`].
 //!
-//! **Metadata caching:** `getattr`, `lookup` (including negative results), and
-//! `readdir` results are cached with a TTL so repeated metadata queries (as file
-//! managers issue constantly) avoid remote round-trips. Mutations invalidate the
-//! affected cache entries. In [`CacheMode::Offline`] the cache is served
-//! regardless of age and the remote is never contacted.
+//! **Metadata + content caching:** metadata (`getattr`/`lookup`/`readdir`) and
+//! whole-file content are cached in a persistent, path-keyed [`Store`] under
+//! `cache_dir`, so a previously cached tree survives a restart and can be served
+//! offline. An in-memory per-session freshness map applies a TTL for online
+//! revalidation and a short-TTL negative-lookup cache; in [`CacheMode::Offline`]
+//! the store is served regardless of age and the remote is never contacted.
+//! `Remote` mode reads straight through without caching content.
 //!
-//! **Content caching:** in content-caching modes (`OnDemand`/`Pinned`), the
-//! first read of a file hydrates the whole file into an on-disk cache and later
-//! reads are served locally until it changes or is written (see
-//! [`ContentCache`]). `Remote` mode reads straight through; `Offline` mode only
-//! serves already-cached content. Writes are write-through to the remote and
-//! evict the cached copy (`flush` is a no-op, no dirty state yet).
-//!
+//! Writes are write-through to the remote and evict the cached copy (`flush` is
+//! a no-op, no dirty state yet) — so on reconnect the server is authoritative.
 //! When the mount is read-only, mutating operations are rejected with
 //! [`Error::PermissionDenied`].
 
@@ -26,10 +23,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::content_cache::ContentCache;
+use crate::store::Store;
 use crate::{
     CacheMode, CreatedFile, DirectoryEntry, Error, FileAttributes, FileHandle, FileMetadata, NodeId,
-    OpenFlags, RemoteFilesystem, RemotePath, Result, SetAttributes, VirtualFilesystem,
+    OpenFlags, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result, SetAttributes,
+    VirtualFilesystem,
 };
 
 /// Longest a negative (name-not-found) cache entry is trusted, capped so a file
@@ -42,20 +40,18 @@ struct OpenFile {
     path: RemotePath,
 }
 
-/// Mutable registry and metadata cache shared behind a mutex.
+/// Per-session registry and freshness tracking (the durable cache lives in the
+/// `Store`). `validated` records when a path's metadata was last confirmed
+/// against the remote (for the online TTL); `negative` caches recent
+/// not-found lookups.
 struct State {
     next_node: u64,
     next_handle: u64,
     path_to_node: HashMap<RemotePath, NodeId>,
     node_to_path: HashMap<NodeId, RemotePath>,
     handles: HashMap<FileHandle, OpenFile>,
-
-    // Metadata cache. Each entry records when it was fetched so a TTL can be
-    // applied. `lookups` maps (parent, name) to the child node, or `None` for a
-    // cached negative (not-found) result.
-    attrs: HashMap<NodeId, (FileAttributes, Instant)>,
-    lookups: HashMap<(NodeId, String), (Option<NodeId>, Instant)>,
-    dirs: HashMap<NodeId, (Vec<DirectoryEntry>, Instant)>,
+    validated: HashMap<RemotePath, Instant>,
+    negative: HashMap<(NodeId, String), Instant>,
 }
 
 impl State {
@@ -87,40 +83,24 @@ impl State {
     }
 
     /// Re-point the node mapped to `from` (if any) at `to` after a rename, so the
-    /// node identity survives the move. Descendants of a renamed directory are
-    /// not rewritten — they are re-resolved by path on next access.
+    /// node identity survives the move.
     fn rename_path(&mut self, from: &RemotePath, to: &RemotePath) {
         if let Some(node) = self.path_to_node.remove(from) {
             self.path_to_node.insert(to.clone(), node);
             self.node_to_path.insert(node, to.clone());
         }
     }
-
-    /// Drop a node's cached attributes and (if it is a directory) its listing.
-    fn invalidate_node(&mut self, node: NodeId) {
-        self.attrs.remove(&node);
-        self.dirs.remove(&node);
-    }
-
-    /// Record that `name` no longer exists under `parent` (negative entry).
-    fn mark_absent(&mut self, parent: NodeId, name: &str, now: Instant) {
-        self.lookups.insert((parent, name.to_string()), (None, now));
-    }
-
-    /// Forget any cached resolution of `name` under `parent`.
-    fn forget_name(&mut self, parent: NodeId, name: &str) {
-        self.lookups.remove(&(parent, name.to_string()));
-    }
 }
 
-/// Cache-backed write-through virtual filesystem over a [`RemoteFilesystem`].
+/// Persistent, cache-backed write-through virtual filesystem over a
+/// [`RemoteFilesystem`].
 pub struct CacheVfs {
     remote: Arc<dyn RemoteFilesystem>,
     read_only: bool,
     cache_mode: CacheMode,
     metadata_ttl: Duration,
     negative_ttl: Duration,
-    content: ContentCache,
+    store: Store,
     state: Mutex<State>,
 }
 
@@ -148,18 +128,37 @@ impl CacheVfs {
             cache_mode,
             metadata_ttl,
             negative_ttl: metadata_ttl.min(NEGATIVE_TTL_CAP),
-            content: ContentCache::new(cache_dir),
+            store: Store::new(cache_dir),
             state: Mutex::new(State {
                 next_node: NodeId::ROOT.0 + 1,
                 next_handle: 1,
                 path_to_node,
                 node_to_path,
                 handles: HashMap::new(),
-                attrs: HashMap::new(),
-                lookups: HashMap::new(),
-                dirs: HashMap::new(),
+                validated: HashMap::new(),
+                negative: HashMap::new(),
             }),
         }
+    }
+
+    /// Create an offline VFS backed only by the persistent cache at `cache_dir`.
+    /// No remote is contacted, so a previously cached tree can be browsed and
+    /// read without any connection; uncached paths report not-found and mutations
+    /// report unavailable.
+    pub fn new_offline(
+        root: RemotePath,
+        read_only: bool,
+        metadata_ttl: Duration,
+        cache_dir: PathBuf,
+    ) -> Self {
+        Self::new(
+            Arc::new(DisconnectedRemote),
+            root,
+            read_only,
+            CacheMode::Offline,
+            metadata_ttl,
+            cache_dir,
+        )
     }
 
     /// Lock the state, recovering from a poisoned mutex rather than propagating
@@ -174,10 +173,17 @@ impl CacheVfs {
         self.cache_mode == CacheMode::Offline
     }
 
-    /// Whether a positive cache entry fetched at `at` is still trusted. Offline
-    /// mode trusts cached metadata regardless of age.
-    fn fresh(&self, at: Instant) -> bool {
-        self.offline() || at.elapsed() < self.metadata_ttl
+    /// Whether the store's metadata for `path` is trustworthy without contacting
+    /// the remote: always in offline mode, otherwise within the TTL of the last
+    /// online validation.
+    fn metadata_fresh(&self, path: &RemotePath) -> bool {
+        if self.offline() {
+            return true;
+        }
+        self.lock()
+            .validated
+            .get(path)
+            .is_some_and(|at| at.elapsed() < self.metadata_ttl)
     }
 
     /// Whether a negative (not-found) cache entry fetched at `at` is trusted.
@@ -200,48 +206,89 @@ impl CacheVfs {
     }
 }
 
+/// A remote that is never reachable, used by [`CacheVfs::offline`]. In offline
+/// mode the VFS serves entirely from the persistent cache and only reaches the
+/// transport for mutations, which correctly fail as unavailable.
+struct DisconnectedRemote;
+
+fn disconnected() -> Error {
+    Error::Unavailable("the mount is offline; the remote is not connected".to_string())
+}
+
+impl RemoteFilesystem for DisconnectedRemote {
+    fn stat(&self, _: &RemotePath) -> Result<FileAttributes> {
+        Err(disconnected())
+    }
+    fn read_dir(&self, _: &RemotePath) -> Result<Vec<RemoteDirectoryEntry>> {
+        Err(disconnected())
+    }
+    fn read(&self, _: &RemotePath, _: u64, _: u32) -> Result<Vec<u8>> {
+        Err(disconnected())
+    }
+    fn write(&self, _: &RemotePath, _: u64, _: &[u8]) -> Result<u32> {
+        Err(disconnected())
+    }
+    fn create(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+        Err(disconnected())
+    }
+    fn mkdir(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+        Err(disconnected())
+    }
+    fn unlink(&self, _: &RemotePath) -> Result<()> {
+        Err(disconnected())
+    }
+    fn rmdir(&self, _: &RemotePath) -> Result<()> {
+        Err(disconnected())
+    }
+    fn rename(&self, _: &RemotePath, _: &RemotePath) -> Result<()> {
+        Err(disconnected())
+    }
+    fn setattr(&self, _: &RemotePath, _: SetAttributes) -> Result<FileAttributes> {
+        Err(disconnected())
+    }
+}
+
 impl VirtualFilesystem for CacheVfs {
     fn lookup(&self, parent: NodeId, name: &str) -> Result<FileMetadata> {
-        // Serve from the metadata cache when the name resolution and the child's
-        // attributes are both still fresh.
+        let child_path = self.child_path(parent, name)?;
+
+        // Recent negative (not-found) result?
         {
             let state = self.lock();
-            if let Some((child, at)) = state.lookups.get(&(parent, name.to_string())) {
-                match child {
-                    None if self.fresh_negative(*at) => return Err(Error::NotFound),
-                    Some(child) if self.fresh(*at) => {
-                        if let Some((attributes, attr_at)) = state.attrs.get(child)
-                            && self.fresh(*attr_at)
-                        {
-                            return Ok(FileMetadata {
-                                node: *child,
-                                attributes: attributes.clone(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+            if let Some(at) = state.negative.get(&(parent, name.to_string()))
+                && self.fresh_negative(*at)
+            {
+                return Err(Error::NotFound);
             }
         }
 
-        let child_path = self.lock().path_of(parent)?.join(name)?;
+        // Fresh (or offline) cached metadata from the persistent store.
+        if self.metadata_fresh(&child_path)
+            && let Some(attributes) = self.store.get_attrs(&child_path)
+        {
+            let node = self.lock().intern(child_path);
+            return Ok(FileMetadata { node, attributes });
+        }
         if self.offline() {
             return Err(Error::NotFound);
         }
 
         match self.remote.stat(&child_path) {
             Ok(attributes) => {
-                let now = Instant::now();
-                let mut state = self.lock();
-                let node = state.intern(child_path);
-                state
-                    .lookups
-                    .insert((parent, name.to_string()), (Some(node), now));
-                state.attrs.insert(node, (attributes.clone(), now));
+                self.store.put_attrs(&child_path, &attributes);
+                let node = {
+                    let mut state = self.lock();
+                    state.validated.insert(child_path.clone(), Instant::now());
+                    state.negative.remove(&(parent, name.to_string()));
+                    state.intern(child_path)
+                };
                 Ok(FileMetadata { node, attributes })
             }
             Err(Error::NotFound) => {
-                self.lock().mark_absent(parent, name, Instant::now());
+                self.store.remove(&child_path);
+                self.lock()
+                    .negative
+                    .insert((parent, name.to_string()), Instant::now());
                 Err(Error::NotFound)
             }
             Err(other) => Err(other),
@@ -249,71 +296,94 @@ impl VirtualFilesystem for CacheVfs {
     }
 
     fn getattr(&self, node: NodeId) -> Result<FileMetadata> {
-        {
-            let state = self.lock();
-            if let Some((attributes, at)) = state.attrs.get(&node)
-                && self.fresh(*at)
-            {
-                return Ok(FileMetadata {
-                    node,
-                    attributes: attributes.clone(),
-                });
-            }
-        }
-
         let path = self.lock().path_of(node)?;
+        if self.metadata_fresh(&path)
+            && let Some(attributes) = self.store.get_attrs(&path)
+        {
+            return Ok(FileMetadata { node, attributes });
+        }
         if self.offline() {
             return Err(Error::NotFound);
         }
-        let attributes = self.remote.stat(&path)?;
-        self.lock()
-            .attrs
-            .insert(node, (attributes.clone(), Instant::now()));
-        Ok(FileMetadata { node, attributes })
+        match self.remote.stat(&path) {
+            Ok(attributes) => {
+                self.store.put_attrs(&path, &attributes);
+                self.lock().validated.insert(path, Instant::now());
+                Ok(FileMetadata { node, attributes })
+            }
+            // The server no longer has it; drop the cached copy (server wins).
+            Err(Error::NotFound) => {
+                self.store.remove(&path);
+                Err(Error::NotFound)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     fn readdir(&self, node: NodeId) -> Result<Vec<DirectoryEntry>> {
-        {
-            let state = self.lock();
-            if let Some((entries, at)) = state.dirs.get(&node)
-                && self.fresh(*at)
-            {
-                return Ok(entries.clone());
-            }
-        }
-
         let path = self.lock().path_of(node)?;
+
+        if self.metadata_fresh(&path)
+            && let Some(children) = self.store.get_children(&path)
+        {
+            // Gather child attributes (store lock) then intern nodes (state
+            // lock) — never holding both locks at once.
+            let mut collected = Vec::with_capacity(children.len());
+            for name in &children {
+                let child_path = path.join(name)?;
+                if let Some(attributes) = self.store.get_attrs(&child_path) {
+                    collected.push((name.clone(), child_path, attributes));
+                }
+            }
+            let mut state = self.lock();
+            let result = collected
+                .into_iter()
+                .map(|(name, child_path, attributes)| {
+                    let child = state.intern(child_path);
+                    DirectoryEntry {
+                        name,
+                        metadata: FileMetadata {
+                            node: child,
+                            attributes,
+                        },
+                    }
+                })
+                .collect();
+            return Ok(result);
+        }
         if self.offline() {
             return Err(Error::NotFound);
         }
-        let entries = self.remote.read_dir(&path)?;
 
+        let entries = self.remote.read_dir(&path)?;
         let now = Instant::now();
-        let mut state = self.lock();
-        let mut result = Vec::with_capacity(entries.len());
+        let mut children = Vec::with_capacity(entries.len());
         for entry in entries {
             // The transport may surface "." / ".."; the VFS exposes only real
             // children and lets the platform adapter synthesize the dot entries.
             if entry.name == "." || entry.name == ".." {
                 continue;
             }
-            let child_path = path.join(&entry.name)?;
+            children.push((entry.name, entry.attributes));
+        }
+        // Persist the listing and every child's attributes in a single write.
+        self.store.record_listing(&path, children.clone());
+
+        let mut state = self.lock();
+        let mut result = Vec::with_capacity(children.len());
+        for (name, attributes) in children {
+            let child_path = path.join(&name)?;
+            state.validated.insert(child_path.clone(), now);
             let child = state.intern(child_path);
-            // Populate the per-child caches so following getattr/lookup calls
-            // (which a listing is invariably followed by) are cache hits.
-            state.attrs.insert(child, (entry.attributes.clone(), now));
-            state
-                .lookups
-                .insert((node, entry.name.clone()), (Some(child), now));
             result.push(DirectoryEntry {
-                name: entry.name,
+                name,
                 metadata: FileMetadata {
                     node: child,
-                    attributes: entry.attributes,
+                    attributes,
                 },
             });
         }
-        state.dirs.insert(node, (result.clone(), now));
+        state.validated.insert(path, now);
         Ok(result)
     }
 
@@ -331,8 +401,8 @@ impl VirtualFilesystem for CacheVfs {
                     ..SetAttributes::default()
                 },
             )?;
-            self.lock().invalidate_node(node);
-            self.content.invalidate(node);
+            self.store.invalidate_content(&path);
+            self.lock().validated.remove(&path);
         }
         Ok(self.lock().open_handle(node, path))
     }
@@ -350,32 +420,32 @@ impl VirtualFilesystem for CacheVfs {
             // Prefer direct remote access; do not populate the content cache.
             CacheMode::Remote => self.remote.read(&path, offset, size),
             // Serve only what is already hydrated; never contact the remote.
-            CacheMode::Offline => self.content.read_cached(node, offset, size),
+            CacheMode::Offline => self.store.read_cached(&path, offset, size),
             // Hydrate on first read (revalidating against current metadata) and
             // serve locally thereafter.
             CacheMode::OnDemand | CacheMode::Pinned => {
                 let attributes = self.getattr(node)?.attributes;
-                self.content
-                    .read(node, &path, self.remote.as_ref(), &attributes, offset, size)
+                self.store
+                    .read(&path, self.remote.as_ref(), &attributes, offset, size)
             }
         }
     }
 
     fn write(&self, handle: FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
         self.ensure_writable()?;
-        let (node, path) = {
+        let path = {
             let state = self.lock();
-            let file = state
+            state
                 .handles
                 .get(&handle)
-                .ok_or_else(|| Error::InvalidInput("unknown file handle".to_string()))?;
-            (file.node, file.path.clone())
+                .map(|file| file.path.clone())
+                .ok_or_else(|| Error::InvalidInput("unknown file handle".to_string()))?
         };
         let written = self.remote.write(&path, offset, data)?;
-        // The write changed size/mtime and the file's contents; drop both the
-        // cached attributes and the cached content so the next read re-hydrates.
-        self.lock().invalidate_node(node);
-        self.content.invalidate(node);
+        // The write changed the contents and size/mtime: drop the cached content
+        // and force a metadata re-validation on the next getattr.
+        self.store.invalidate_content(&path);
+        self.lock().validated.remove(&path);
         Ok(written)
     }
 
@@ -397,18 +467,20 @@ impl VirtualFilesystem for CacheVfs {
         _flags: OpenFlags,
     ) -> Result<CreatedFile> {
         self.ensure_writable()?;
-        let child_path = self.child_path(parent, name)?;
+        let parent_path = self.lock().path_of(parent)?;
+        let child_path = parent_path.join(name)?;
         let attributes = self.remote.create(&child_path, mode)?;
 
-        let now = Instant::now();
-        let mut state = self.lock();
-        let node = state.intern(child_path.clone());
-        let handle = state.open_handle(node, child_path);
-        state.attrs.insert(node, (attributes.clone(), now));
-        state
-            .lookups
-            .insert((parent, name.to_string()), (Some(node), now));
-        state.dirs.remove(&parent);
+        self.store.put_attrs(&child_path, &attributes);
+        self.store.invalidate_children(&parent_path);
+        let (node, handle) = {
+            let mut state = self.lock();
+            state.validated.insert(child_path.clone(), Instant::now());
+            state.negative.remove(&(parent, name.to_string()));
+            let node = state.intern(child_path.clone());
+            let handle = state.open_handle(node, child_path);
+            (node, handle)
+        };
         Ok(CreatedFile {
             metadata: FileMetadata { node, attributes },
             handle,
@@ -417,86 +489,85 @@ impl VirtualFilesystem for CacheVfs {
 
     fn mkdir(&self, parent: NodeId, name: &str, mode: u32) -> Result<FileMetadata> {
         self.ensure_writable()?;
-        let child_path = self.child_path(parent, name)?;
+        let parent_path = self.lock().path_of(parent)?;
+        let child_path = parent_path.join(name)?;
         let attributes = self.remote.mkdir(&child_path, mode)?;
 
-        let now = Instant::now();
-        let mut state = self.lock();
-        let node = state.intern(child_path);
-        state.attrs.insert(node, (attributes.clone(), now));
-        state
-            .lookups
-            .insert((parent, name.to_string()), (Some(node), now));
-        state.dirs.remove(&parent);
+        self.store.put_attrs(&child_path, &attributes);
+        self.store.invalidate_children(&parent_path);
+        let node = {
+            let mut state = self.lock();
+            state.validated.insert(child_path.clone(), Instant::now());
+            state.negative.remove(&(parent, name.to_string()));
+            state.intern(child_path)
+        };
         Ok(FileMetadata { node, attributes })
     }
 
     fn unlink(&self, parent: NodeId, name: &str) -> Result<()> {
         self.ensure_writable()?;
-        let child_path = self.child_path(parent, name)?;
+        let parent_path = self.lock().path_of(parent)?;
+        let child_path = parent_path.join(name)?;
         self.remote.unlink(&child_path)?;
 
-        let node = {
-            let mut state = self.lock();
-            let node = state.path_to_node.get(&child_path).copied();
-            if let Some(node) = node {
-                state.invalidate_node(node);
-            }
-            state.mark_absent(parent, name, Instant::now());
-            state.dirs.remove(&parent);
-            node
-        };
-        if let Some(node) = node {
-            self.content.invalidate(node);
-        }
+        self.store.remove(&child_path);
+        self.store.invalidate_children(&parent_path);
+        self.lock()
+            .negative
+            .insert((parent, name.to_string()), Instant::now());
         Ok(())
     }
 
     fn rmdir(&self, parent: NodeId, name: &str) -> Result<()> {
         self.ensure_writable()?;
-        let child_path = self.child_path(parent, name)?;
+        let parent_path = self.lock().path_of(parent)?;
+        let child_path = parent_path.join(name)?;
         self.remote.rmdir(&child_path)?;
 
-        let mut state = self.lock();
-        if let Some(&node) = state.path_to_node.get(&child_path) {
-            state.invalidate_node(node);
-        }
-        state.mark_absent(parent, name, Instant::now());
-        state.dirs.remove(&parent);
+        self.store.remove(&child_path);
+        self.store.invalidate_children(&parent_path);
+        self.lock()
+            .negative
+            .insert((parent, name.to_string()), Instant::now());
         Ok(())
     }
 
     fn rename(&self, parent: NodeId, name: &str, new_parent: NodeId, new_name: &str) -> Result<()> {
         self.ensure_writable()?;
-        let from = self.child_path(parent, name)?;
-        let to = self.child_path(new_parent, new_name)?;
+        let (from, to, from_parent, to_parent) = {
+            let state = self.lock();
+            let from_parent = state.path_of(parent)?;
+            let to_parent = state.path_of(new_parent)?;
+            (
+                from_parent.join(name)?,
+                to_parent.join(new_name)?,
+                from_parent,
+                to_parent,
+            )
+        };
         self.remote.rename(&from, &to)?;
 
+        self.store.rename(&from, &to);
+        self.store.invalidate_children(&from_parent);
+        self.store.invalidate_children(&to_parent);
         let mut state = self.lock();
         state.rename_path(&from, &to);
-        if let Some(&node) = state.path_to_node.get(&to) {
-            state.invalidate_node(node);
-        }
-        state.mark_absent(parent, name, Instant::now());
-        state.forget_name(new_parent, new_name);
-        state.dirs.remove(&parent);
-        state.dirs.remove(&new_parent);
+        state.validated.remove(&from);
+        state
+            .negative
+            .insert((parent, name.to_string()), Instant::now());
+        state.negative.remove(&(new_parent, new_name.to_string()));
         Ok(())
     }
 
     fn setattr(&self, node: NodeId, attributes: SetAttributes) -> Result<FileMetadata> {
         self.ensure_writable()?;
-        let resizes = attributes.size.is_some();
         let path = self.lock().path_of(node)?;
         let attributes = self.remote.setattr(&path, attributes)?;
-        // Refresh the cache with the server's post-change attributes.
-        self.lock()
-            .attrs
-            .insert(node, (attributes.clone(), Instant::now()));
-        // A size change (truncate/extend) alters the contents; evict them.
-        if resizes {
-            self.content.invalidate(node);
-        }
+        // Store the fresh attributes (this also drops cached content when the
+        // version changed) and mark the metadata validated.
+        self.store.put_attrs(&path, &attributes);
+        self.lock().validated.insert(path, Instant::now());
         Ok(FileMetadata { node, attributes })
     }
 }
@@ -779,15 +850,27 @@ mod tests {
     // A generous TTL so caching is active and invalidation logic is exercised.
     const LONG_TTL: Duration = Duration::from_secs(3600);
 
-    /// A cache dir that is never actually written to (Remote-mode helpers below
-    /// don't hydrate content, and metadata-only tests never touch disk).
-    fn unused_cache_dir() -> PathBuf {
-        std::env::temp_dir().join("cacheshfs-tests-unused")
+    /// A fresh, unique cache directory per VFS instance (the store persists into
+    /// it, so tests must not share one). Left on disk; the OS temp is reaped.
+    fn fresh_cache_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cacheshfs-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Count content objects currently in a cache dir.
+    fn objects_count(cache_dir: &std::path::Path) -> usize {
+        std::fs::read_dir(cache_dir.join("objects"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
     }
 
     // These general helpers use `Remote` mode so reads pass through the mock
     // (no on-disk content cache), while metadata caching stays active. Content
-    // caching has its own helper (`content_vfs`) with a real temp dir.
+    // caching has its own helper (`content_vfs`).
     fn vfs() -> CacheVfs {
         CacheVfs::new(
             Arc::new(MockRemote::new()),
@@ -795,7 +878,7 @@ mod tests {
             false,
             CacheMode::Remote,
             LONG_TTL,
-            unused_cache_dir(),
+            fresh_cache_dir(),
         )
     }
 
@@ -806,7 +889,7 @@ mod tests {
             true,
             CacheMode::Remote,
             LONG_TTL,
-            unused_cache_dir(),
+            fresh_cache_dir(),
         )
     }
 
@@ -819,7 +902,7 @@ mod tests {
             false,
             mode,
             ttl,
-            unused_cache_dir(),
+            fresh_cache_dir(),
         );
         (vfs, remote)
     }
@@ -838,6 +921,42 @@ mod tests {
             dir.path().to_path_buf(),
         );
         (vfs, remote, dir)
+    }
+
+    /// A remote that panics on any call — used to prove offline mode never
+    /// contacts the server.
+    struct PanicRemote;
+    impl RemoteFilesystem for PanicRemote {
+        fn stat(&self, _: &RemotePath) -> Result<FileAttributes> {
+            unreachable!("offline mode must not contact the remote")
+        }
+        fn read_dir(&self, _: &RemotePath) -> Result<Vec<RemoteDirectoryEntry>> {
+            unreachable!("offline mode must not contact the remote")
+        }
+        fn read(&self, _: &RemotePath, _: u64, _: u32) -> Result<Vec<u8>> {
+            unreachable!("offline mode must not contact the remote")
+        }
+        fn write(&self, _: &RemotePath, _: u64, _: &[u8]) -> Result<u32> {
+            unreachable!()
+        }
+        fn create(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+            unreachable!()
+        }
+        fn mkdir(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+            unreachable!()
+        }
+        fn unlink(&self, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn rmdir(&self, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn rename(&self, _: &RemotePath, _: &RemotePath) -> Result<()> {
+            unreachable!()
+        }
+        fn setattr(&self, _: &RemotePath, _: SetAttributes) -> Result<FileAttributes> {
+            unreachable!()
+        }
     }
 
     /// Open `name` under the root for reading and return (node, handle).
@@ -1336,7 +1455,8 @@ mod tests {
 
         assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
         // The whole file was hydrated to an on-disk object.
-        assert!(crate::content_cache::object_exists(dir.path(), node));
+        let _ = node;
+        assert_eq!(objects_count(dir.path()), 1);
 
         let reads = remote.read_calls();
         // Further reads (including partial ones) are served locally.
@@ -1373,10 +1493,11 @@ mod tests {
     #[test]
     fn remote_mode_does_not_cache_content() {
         let (vfs, _remote, dir) = content_vfs(CacheMode::Remote, LONG_TTL);
-        let (node, handle) = open_for_read(&vfs, "readme.txt");
+        let (_node, handle) = open_for_read(&vfs, "readme.txt");
         assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
-        assert!(
-            !crate::content_cache::object_exists(dir.path(), node),
+        assert_eq!(
+            objects_count(dir.path()),
+            0,
             "remote mode reads straight through and must not hydrate"
         );
     }
@@ -1392,5 +1513,66 @@ mod tests {
         // Something else changes the file on the remote (new size + mtime).
         remote.set_file("/readme.txt", b"goodbye!");
         assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"goodbye!");
+    }
+
+    #[test]
+    fn cache_persists_across_restart_for_offline_reads() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Session 1: online, hydrate a file (persists metadata + content).
+        {
+            let vfs = CacheVfs::new(
+                Arc::new(MockRemote::new()),
+                RemotePath::root(),
+                false,
+                CacheMode::OnDemand,
+                LONG_TTL,
+                dir.path().to_path_buf(),
+            );
+            let (_node, handle) = open_for_read(&vfs, "readme.txt");
+            assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+        }
+
+        // Session 2: a brand-new offline mount over the same cache dir, with a
+        // remote that panics if touched. The file is resolved and read purely
+        // from the persisted cache.
+        let vfs = CacheVfs::new(
+            Arc::new(PanicRemote),
+            RemotePath::root(),
+            false,
+            CacheMode::Offline,
+            LONG_TTL,
+            dir.path().to_path_buf(),
+        );
+        let node = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
+        let handle = vfs
+            .open(
+                node,
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn offline_read_of_uncached_file_is_unavailable() {
+        // Offline, empty cache: metadata for an unknown name is NotFound and a
+        // hypothetical read has nothing to serve.
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = CacheVfs::new(
+            Arc::new(PanicRemote),
+            RemotePath::root(),
+            false,
+            CacheMode::Offline,
+            LONG_TTL,
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "readme.txt"),
+            Err(Error::NotFound)
+        ));
     }
 }
