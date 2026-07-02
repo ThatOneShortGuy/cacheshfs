@@ -2,6 +2,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cacheshfs_core::{CacheMode, MountConfig, RemoteConfig};
 use cacheshfs_sftp::{SftpConnectOptions, SftpTarget};
@@ -103,9 +104,6 @@ impl Cli {
         if self.ssh_config.is_some() {
             names.push("--ssh-config");
         }
-        if self.metadata_ttl.is_some() {
-            names.push("--metadata-ttl");
-        }
         if self.content_ttl.is_some() {
             names.push("--content-ttl");
         }
@@ -146,6 +144,14 @@ impl Cli {
         })
     }
 
+    /// The metadata cache TTL, from `--metadata-ttl` or a default.
+    pub fn metadata_ttl_duration(&self) -> Result<Duration, String> {
+        match &self.metadata_ttl {
+            Some(text) => parse_duration(text),
+            None => Ok(DEFAULT_METADATA_TTL),
+        }
+    }
+
     /// Build the SFTP connection options for `target` (the `[user@]host` part of
     /// the remote spec), applying the `--port`, `--identity-file`, and
     /// `--accept-unknown-host-key` flags on top of the transport defaults.
@@ -164,6 +170,38 @@ impl Cli {
         }
         Ok(options)
     }
+}
+
+/// Default metadata cache TTL when `--metadata-ttl` is not given.
+const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(5);
+
+/// Parse a duration like `500ms`, `30s`, `5m`, `1h`, or a bare number of
+/// seconds.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let invalid = || format!("invalid duration '{text}' (use e.g. 30s, 5m, 1h, 500ms)");
+
+    let (value, unit): (&str, &str) = if let Some(rest) = text.strip_suffix("ms") {
+        (rest, "ms")
+    } else if let Some(rest) = text.strip_suffix('s') {
+        (rest, "s")
+    } else if let Some(rest) = text.strip_suffix('m') {
+        (rest, "m")
+    } else if let Some(rest) = text.strip_suffix('h') {
+        (rest, "h")
+    } else {
+        (text, "s")
+    };
+
+    let value: u64 = value.trim().parse().map_err(|_| invalid())?;
+    let duration = match unit {
+        "ms" => Duration::from_millis(value),
+        "s" => Duration::from_secs(value),
+        "m" => Duration::from_secs(value * 60),
+        "h" => Duration::from_secs(value * 3600),
+        _ => return Err(invalid()),
+    };
+    Ok(duration)
 }
 
 /// Parse a `[user@]host:/remote/path` spec into a [`RemoteConfig`].

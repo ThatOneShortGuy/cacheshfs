@@ -34,9 +34,10 @@ fn run(cli: Cli) -> Result<(), String> {
         );
     }
 
-    // Validate the remote root before opening a connection.
+    // Validate the remote root and cache settings before opening a connection.
     let root = RemotePath::new(config.remote.root.clone())
         .map_err(|error| format!("invalid remote path: {error}"))?;
+    let metadata_ttl = cli.metadata_ttl_duration()?;
 
     // Connect the SFTP transport.
     let options = cli.connect_options(&config.remote.target)?;
@@ -45,8 +46,13 @@ fn run(cli: Cli) -> Result<(), String> {
 
     // The shared cache-backed VFS sits between the platform mount backend and
     // the remote transport.
-    let filesystem: Arc<dyn VirtualFilesystem> =
-        Arc::new(CacheVfs::new(Arc::new(remote), root, config.read_only));
+    let filesystem: Arc<dyn VirtualFilesystem> = Arc::new(CacheVfs::new(
+        Arc::new(remote),
+        root,
+        config.read_only,
+        config.cache_mode,
+        metadata_ttl,
+    ));
 
     platform_backend()
         .mount(config, filesystem)
