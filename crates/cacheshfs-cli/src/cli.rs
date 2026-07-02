@@ -82,12 +82,25 @@ pub struct Cli {
 }
 
 /// CLI spelling of [`CacheMode`]. Clap renders these as `remote`, `on-demand`,
-/// `pinned`, `offline`.
+/// `pinned`, `offline`. The per-variant doc comments below become the value
+/// descriptions shown in the long `--help` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CacheModeArg {
+    /// Pass-through: every read and stat goes straight to the server and
+    /// nothing is written to the local content cache. Lowest memory/disk use,
+    /// no offline reads, and no speedup on repeated access.
     Remote,
+    /// Cache files and metadata as they are accessed. The first read of a file
+    /// downloads and stores it; later reads are served locally until the server
+    /// copy changes (revalidated by size/mtime) or the file is written. Best
+    /// general-purpose mode.
     OnDemand,
+    /// Like on-demand today (a distinct keep-resident/prefetch policy is not yet
+    /// implemented, so it currently behaves the same as `on-demand`).
     Pinned,
+    /// Serve entirely from the persistent cache and never open a connection.
+    /// Previously cached files and directories are readable offline; uncached
+    /// paths report not-found and writes are rejected.
     Offline,
 }
 
