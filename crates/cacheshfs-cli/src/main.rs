@@ -8,7 +8,7 @@ mod cli;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use cacheshfs_core::{CacheVfs, MountBackend, RemotePath, VirtualFilesystem};
+use cacheshfs_core::{CacheMode, CacheVfs, MountBackend, RemotePath, VirtualFilesystem};
 use cacheshfs_sftp::SftpBackend;
 use clap::Parser;
 
@@ -39,21 +39,33 @@ fn run(cli: Cli) -> Result<(), String> {
         .map_err(|error| format!("invalid remote path: {error}"))?;
     let metadata_ttl = cli.metadata_ttl_duration()?;
 
-    // Connect the SFTP transport.
-    let options = cli.connect_options(&config.remote.target)?;
-    let remote = SftpBackend::connect_with_options(options)
-        .map_err(|error| format!("failed to connect to {}: {error}", config.remote.target))?;
+    // In offline mode we serve entirely from the persistent cache and never
+    // open a connection, so a previously cached tree stays browsable and
+    // readable even when the remote is unreachable. Any other mode connects the
+    // SFTP transport as usual.
+    let filesystem: Arc<dyn VirtualFilesystem> = if config.cache_mode == CacheMode::Offline {
+        Arc::new(CacheVfs::new_offline(
+            root,
+            config.read_only,
+            metadata_ttl,
+            config.cache_dir.clone(),
+        ))
+    } else {
+        let options = cli.connect_options(&config.remote.target)?;
+        let remote = SftpBackend::connect_with_options(options)
+            .map_err(|error| format!("failed to connect to {}: {error}", config.remote.target))?;
 
-    // The shared cache-backed VFS sits between the platform mount backend and
-    // the remote transport.
-    let filesystem: Arc<dyn VirtualFilesystem> = Arc::new(CacheVfs::new(
-        Arc::new(remote),
-        root,
-        config.read_only,
-        config.cache_mode,
-        metadata_ttl,
-        config.cache_dir.clone(),
-    ));
+        // The shared cache-backed VFS sits between the platform mount backend
+        // and the remote transport.
+        Arc::new(CacheVfs::new(
+            Arc::new(remote),
+            root,
+            config.read_only,
+            config.cache_mode,
+            metadata_ttl,
+            config.cache_dir.clone(),
+        ))
+    };
 
     platform_backend()
         .mount(config, filesystem)
