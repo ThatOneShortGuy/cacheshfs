@@ -90,7 +90,9 @@ impl CacheVfs {
     /// Lock the state, recovering from a poisoned mutex rather than propagating
     /// a panic across the FFI boundary into a platform adapter.
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -318,7 +320,9 @@ mod tests {
 
         fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
             let (_, contents) = self.nodes.get(path.as_str()).ok_or(Error::NotFound)?;
-            let contents = contents.as_ref().ok_or(Error::InvalidInput("is a directory".into()))?;
+            let contents = contents
+                .as_ref()
+                .ok_or(Error::InvalidInput("is a directory".into()))?;
             let start = (offset as usize).min(contents.len());
             let end = (start + size as usize).min(contents.len());
             Ok(contents[start..end].to_vec())
@@ -386,7 +390,12 @@ mod tests {
 
         // A node id from readdir matches the one from a direct lookup.
         let from_lookup = vfs.lookup(NodeId::ROOT, "sub").unwrap().node;
-        let from_readdir = entries.iter().find(|e| e.name == "sub").unwrap().metadata.node;
+        let from_readdir = entries
+            .iter()
+            .find(|e| e.name == "sub")
+            .unwrap()
+            .metadata
+            .node;
         assert_eq!(from_lookup, from_readdir);
     }
 
@@ -397,7 +406,15 @@ mod tests {
         let file = vfs.lookup(sub, "a.txt").unwrap();
         assert_eq!(file.attributes.kind, FileKind::File);
 
-        let handle = vfs.open(file.node, OpenFlags { read: true, ..Default::default() }).unwrap();
+        let handle = vfs
+            .open(
+                file.node,
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let data = vfs.read(handle, 0, 1024).unwrap();
         assert_eq!(data, b"aaaa");
 
@@ -415,7 +432,14 @@ mod tests {
         let vfs = vfs();
         let file = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
         let err = vfs
-            .open(file, OpenFlags { read: true, write: true, ..Default::default() })
+            .open(
+                file,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .unwrap_err();
         assert!(matches!(err, Error::UnsupportedOperation(_)));
     }
@@ -457,5 +481,224 @@ mod tests {
     #[test]
     fn getattr_unknown_node_is_not_found() {
         assert!(matches!(vfs().getattr(NodeId(999)), Err(Error::NotFound)));
+    }
+
+    struct WritableRemote {
+        nodes: StdMutex<HashMap<String, (FileAttributes, Option<Vec<u8>>)>>,
+        dirs: StdMutex<HashMap<String, Vec<String>>>,
+    }
+
+    impl WritableRemote {
+        fn new() -> Self {
+            let mut nodes = HashMap::new();
+            nodes.insert("/".to_string(), (dir_attrs(), None));
+            nodes.insert(
+                "/readme.txt".to_string(),
+                (file_attrs(5), Some(b"hello".to_vec())),
+            );
+
+            let mut dirs = HashMap::new();
+            dirs.insert("/".to_string(), vec!["readme.txt".to_string()]);
+
+            Self {
+                nodes: StdMutex::new(nodes),
+                dirs: StdMutex::new(dirs),
+            }
+        }
+    }
+
+    impl RemoteFilesystem for WritableRemote {
+        fn stat(&self, path: &RemotePath) -> Result<FileAttributes> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .get(path.as_str())
+                .map(|(attrs, _)| attrs.clone())
+                .ok_or(Error::NotFound)
+        }
+
+        fn read_dir(&self, path: &RemotePath) -> Result<Vec<RemoteDirectoryEntry>> {
+            let dirs = self.dirs.lock().unwrap();
+            let nodes = self.nodes.lock().unwrap();
+            let names = dirs.get(path.as_str()).ok_or(Error::NotFound)?;
+            Ok(names
+                .iter()
+                .map(|name| {
+                    let child = path.join(name).unwrap();
+                    let (attrs, _) = nodes.get(child.as_str()).unwrap();
+                    RemoteDirectoryEntry {
+                        name: name.clone(),
+                        attributes: attrs.clone(),
+                    }
+                })
+                .collect())
+        }
+
+        fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
+            let nodes = self.nodes.lock().unwrap();
+            let (_, contents) = nodes.get(path.as_str()).ok_or(Error::NotFound)?;
+            let contents = contents
+                .as_ref()
+                .ok_or(Error::InvalidInput("is a directory".into()))?;
+            let start = (offset as usize).min(contents.len());
+            let end = (start + size as usize).min(contents.len());
+            Ok(contents[start..end].to_vec())
+        }
+
+        fn write(&self, path: &RemotePath, offset: u64, data: &[u8]) -> Result<u32> {
+            let mut nodes = self.nodes.lock().unwrap();
+            let (attrs, contents) = nodes.get_mut(path.as_str()).ok_or(Error::NotFound)?;
+            let contents = contents
+                .as_mut()
+                .ok_or(Error::InvalidInput("is a directory".into()))?;
+            let start = offset as usize;
+            if contents.len() < start {
+                contents.resize(start, 0);
+            }
+            let end = start + data.len();
+            if contents.len() < end {
+                contents.resize(end, 0);
+            }
+            contents[start..end].copy_from_slice(data);
+            attrs.size = contents.len() as u64;
+            Ok(data.len() as u32)
+        }
+
+        fn create(&self, path: &RemotePath, mode: u32) -> Result<FileAttributes> {
+            let name = path
+                .as_str()
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::InvalidInput("missing file name".to_string()))?;
+            let parent = path
+                .as_str()
+                .rsplit_once('/')
+                .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                .unwrap_or("/");
+
+            let attrs = FileAttributes {
+                kind: FileKind::File,
+                size: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                modified_unix_seconds: None,
+                accessed_unix_seconds: None,
+                changed_unix_seconds: None,
+            };
+
+            let mut nodes = self.nodes.lock().unwrap();
+            if nodes.contains_key(path.as_str()) {
+                return Err(Error::AlreadyExists);
+            }
+            nodes.insert(path.as_str().to_string(), (attrs.clone(), Some(Vec::new())));
+            self.dirs
+                .lock()
+                .unwrap()
+                .entry(parent.to_string())
+                .or_default()
+                .push(name.to_string());
+            Ok(attrs)
+        }
+
+        fn mkdir(&self, _: &RemotePath, _: u32) -> Result<FileAttributes> {
+            Err(Error::UnsupportedOperation("mock"))
+        }
+        fn unlink(&self, _: &RemotePath) -> Result<()> {
+            Err(Error::UnsupportedOperation("mock"))
+        }
+        fn rmdir(&self, _: &RemotePath) -> Result<()> {
+            Err(Error::UnsupportedOperation("mock"))
+        }
+        fn rename(&self, _: &RemotePath, _: &RemotePath) -> Result<()> {
+            Err(Error::UnsupportedOperation("mock"))
+        }
+        fn setattr(&self, _: &RemotePath, _: SetAttributes) -> Result<FileAttributes> {
+            Err(Error::UnsupportedOperation("mock"))
+        }
+    }
+
+    fn writable_vfs() -> CacheVfs {
+        CacheVfs::new(Arc::new(WritableRemote::new()), RemotePath::root())
+    }
+
+    #[test]
+    #[ignore = "write support is not implemented in CacheVfs yet"]
+    fn create_write_flush_release_and_read_round_trip() {
+        let vfs = writable_vfs();
+        let created = vfs
+            .create(
+                NodeId::ROOT,
+                "created.txt",
+                0o640,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(created.metadata.attributes.kind, FileKind::File);
+        assert_eq!(created.metadata.attributes.mode, 0o640);
+        assert_eq!(created.metadata.attributes.size, 0);
+
+        assert_eq!(vfs.write(created.handle, 0, b"hello").unwrap(), 5);
+        vfs.flush(created.handle).unwrap();
+        vfs.release(created.handle).unwrap();
+
+        let looked_up = vfs.lookup(NodeId::ROOT, "created.txt").unwrap();
+        assert_eq!(looked_up.node, created.metadata.node);
+        assert_eq!(looked_up.attributes.size, 5);
+
+        let handle = vfs
+            .open(
+                looked_up.node,
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(vfs.read(handle, 0, 32).unwrap(), b"hello");
+        vfs.release(handle).unwrap();
+    }
+
+    #[test]
+    #[ignore = "write support is not implemented in CacheVfs yet"]
+    fn write_updates_existing_file_at_offset_and_refreshes_size() {
+        let vfs = writable_vfs();
+        let file = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap();
+        let handle = vfs
+            .open(
+                file.node,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vfs.write(handle, 2, b"YY").unwrap(), 2);
+        assert_eq!(vfs.write(handle, 5, b"!").unwrap(), 1);
+        vfs.flush(handle).unwrap();
+        vfs.release(handle).unwrap();
+
+        let refreshed = vfs.getattr(file.node).unwrap();
+        assert_eq!(refreshed.attributes.size, 6);
+
+        let handle = vfs
+            .open(
+                file.node,
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(vfs.read(handle, 0, 32).unwrap(), b"heYYo!");
+        vfs.release(handle).unwrap();
     }
 }
