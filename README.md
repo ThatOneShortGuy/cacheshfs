@@ -57,7 +57,29 @@ cacheshfs server:/home/me/projects Z:
 
 # Read-only, and trust cached data without a connection
 cacheshfs --read-only --cache-mode offline server:/home/me/projects Z:
+
+# From Linux, mount a drive on a Windows host running OpenSSH
+cacheshfs me@winbox:/C:/Users/me/Documents /mnt/winbox
 ```
+
+### Mounting a Windows host's drive from Linux
+
+A Windows machine running an SSH server (e.g. the built-in OpenSSH Server)
+exposes its drives through SFTP with forward slashes and a drive-letter prefix,
+so a path looks like `/C:/Users/me/Documents`. Only the **first** colon separates
+the host from the remote path, so the drive colon is preserved:
+
+```sh
+cacheshfs me@winbox:/C:/Users/me/Documents /mnt/winbox
+```
+
+- `me@winbox` — the SSH target (also resolvable via `~/.ssh/config`).
+- `/C:/Users/me/Documents` — the remote root on the Windows host; use `/D:/...`
+  for another drive, or `/C:/` for the whole `C:` drive.
+- `/mnt/winbox` — the local Linux mountpoint (must exist).
+
+The Windows host only needs an SSH/SFTP server; it does **not** need cacheshfs or
+WinFsp installed — those are for mounting *on* Windows.
 
 The host alias is resolved against your OpenSSH config (`~/.ssh/config` by
 default, or `--ssh-config <path>`): a matching `Host` block supplies `HostName`,
