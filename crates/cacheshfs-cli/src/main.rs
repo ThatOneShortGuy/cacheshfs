@@ -52,6 +52,7 @@ fn run(cli: Cli) -> Result<(), String> {
         config.read_only,
         config.cache_mode,
         metadata_ttl,
+        config.cache_dir.clone(),
     ));
 
     platform_backend()

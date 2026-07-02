@@ -11,15 +11,22 @@
 //! affected cache entries. In [`CacheMode::Offline`] the cache is served
 //! regardless of age and the remote is never contacted.
 //!
-//! **Writes** are still write-through and uncached: reads and writes of file
-//! *contents* always go to the remote (`flush` is a no-op, no dirty state). An
-//! on-disk content cache is a later layer. When the mount is read-only, mutating
-//! operations are rejected with [`Error::PermissionDenied`].
+//! **Content caching:** in content-caching modes (`OnDemand`/`Pinned`), the
+//! first read of a file hydrates the whole file into an on-disk cache and later
+//! reads are served locally until it changes or is written (see
+//! [`ContentCache`]). `Remote` mode reads straight through; `Offline` mode only
+//! serves already-cached content. Writes are write-through to the remote and
+//! evict the cached copy (`flush` is a no-op, no dirty state yet).
+//!
+//! When the mount is read-only, mutating operations are rejected with
+//! [`Error::PermissionDenied`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::content_cache::ContentCache;
 use crate::{
     CacheMode, CreatedFile, DirectoryEntry, Error, FileAttributes, FileHandle, FileMetadata, NodeId,
     OpenFlags, RemoteFilesystem, RemotePath, Result, SetAttributes, VirtualFilesystem,
@@ -113,19 +120,22 @@ pub struct CacheVfs {
     cache_mode: CacheMode,
     metadata_ttl: Duration,
     negative_ttl: Duration,
+    content: ContentCache,
     state: Mutex<State>,
 }
 
 impl CacheVfs {
     /// Create a VFS rooted at `root` on `remote`. The root maps to
     /// [`NodeId::ROOT`]. `read_only` rejects mutations; `cache_mode` and
-    /// `metadata_ttl` control metadata caching.
+    /// `metadata_ttl` control metadata caching; cached file contents live under
+    /// `cache_dir`.
     pub fn new(
         remote: Arc<dyn RemoteFilesystem>,
         root: RemotePath,
         read_only: bool,
         cache_mode: CacheMode,
         metadata_ttl: Duration,
+        cache_dir: PathBuf,
     ) -> Self {
         let mut path_to_node = HashMap::new();
         let mut node_to_path = HashMap::new();
@@ -138,6 +148,7 @@ impl CacheVfs {
             cache_mode,
             metadata_ttl,
             negative_ttl: metadata_ttl.min(NEGATIVE_TTL_CAP),
+            content: ContentCache::new(cache_dir),
             state: Mutex::new(State {
                 next_node: NodeId::ROOT.0 + 1,
                 next_handle: 1,
@@ -321,20 +332,33 @@ impl VirtualFilesystem for CacheVfs {
                 },
             )?;
             self.lock().invalidate_node(node);
+            self.content.invalidate(node);
         }
         Ok(self.lock().open_handle(node, path))
     }
 
     fn read(&self, handle: FileHandle, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let path = {
+        let (node, path) = {
             let state = self.lock();
-            state
+            let file = state
                 .handles
                 .get(&handle)
-                .map(|file| file.path.clone())
-                .ok_or_else(|| Error::InvalidInput("unknown file handle".to_string()))?
+                .ok_or_else(|| Error::InvalidInput("unknown file handle".to_string()))?;
+            (file.node, file.path.clone())
         };
-        self.remote.read(&path, offset, size)
+        match self.cache_mode {
+            // Prefer direct remote access; do not populate the content cache.
+            CacheMode::Remote => self.remote.read(&path, offset, size),
+            // Serve only what is already hydrated; never contact the remote.
+            CacheMode::Offline => self.content.read_cached(node, offset, size),
+            // Hydrate on first read (revalidating against current metadata) and
+            // serve locally thereafter.
+            CacheMode::OnDemand | CacheMode::Pinned => {
+                let attributes = self.getattr(node)?.attributes;
+                self.content
+                    .read(node, &path, self.remote.as_ref(), &attributes, offset, size)
+            }
+        }
     }
 
     fn write(&self, handle: FileHandle, offset: u64, data: &[u8]) -> Result<u32> {
@@ -348,8 +372,10 @@ impl VirtualFilesystem for CacheVfs {
             (file.node, file.path.clone())
         };
         let written = self.remote.write(&path, offset, data)?;
-        // The write changed size/mtime; drop the stale cached attributes.
+        // The write changed size/mtime and the file's contents; drop both the
+        // cached attributes and the cached content so the next read re-hydrates.
         self.lock().invalidate_node(node);
+        self.content.invalidate(node);
         Ok(written)
     }
 
@@ -410,12 +436,19 @@ impl VirtualFilesystem for CacheVfs {
         let child_path = self.child_path(parent, name)?;
         self.remote.unlink(&child_path)?;
 
-        let mut state = self.lock();
-        if let Some(&node) = state.path_to_node.get(&child_path) {
-            state.invalidate_node(node);
+        let node = {
+            let mut state = self.lock();
+            let node = state.path_to_node.get(&child_path).copied();
+            if let Some(node) = node {
+                state.invalidate_node(node);
+            }
+            state.mark_absent(parent, name, Instant::now());
+            state.dirs.remove(&parent);
+            node
+        };
+        if let Some(node) = node {
+            self.content.invalidate(node);
         }
-        state.mark_absent(parent, name, Instant::now());
-        state.dirs.remove(&parent);
         Ok(())
     }
 
@@ -453,12 +486,17 @@ impl VirtualFilesystem for CacheVfs {
 
     fn setattr(&self, node: NodeId, attributes: SetAttributes) -> Result<FileMetadata> {
         self.ensure_writable()?;
+        let resizes = attributes.size.is_some();
         let path = self.lock().path_of(node)?;
         let attributes = self.remote.setattr(&path, attributes)?;
         // Refresh the cache with the server's post-change attributes.
         self.lock()
             .attrs
             .insert(node, (attributes.clone(), Instant::now()));
+        // A size change (truncate/extend) alters the contents; evict them.
+        if resizes {
+            self.content.invalidate(node);
+        }
         Ok(FileMetadata { node, attributes })
     }
 }
@@ -487,6 +525,7 @@ mod tests {
         /// remote call counters, for asserting cache hits
         stat_calls: usize,
         read_dir_calls: usize,
+        read_calls: usize,
     }
 
     /// In-memory mutable remote tree (interior mutability so `&self` methods can
@@ -564,6 +603,7 @@ mod tests {
                     dirs,
                     stat_calls: 0,
                     read_dir_calls: 0,
+                    read_calls: 0,
                 }),
             }
         }
@@ -574,6 +614,20 @@ mod tests {
 
         fn read_dir_calls(&self) -> usize {
             self.state.lock().unwrap().read_dir_calls
+        }
+
+        fn read_calls(&self) -> usize {
+            self.state.lock().unwrap().read_calls
+        }
+
+        /// Replace a file's contents (simulating an external change), bumping its
+        /// size and modification time so cache revalidation notices.
+        fn set_file(&self, path: &str, contents: &[u8]) {
+            let mut state = self.state.lock().unwrap();
+            let (attrs, data) = state.nodes.get_mut(path).expect("file exists");
+            attrs.size = contents.len() as u64;
+            attrs.modified_unix_seconds = Some(attrs.modified_unix_seconds.unwrap_or(0) + 1);
+            *data = Some(contents.to_vec());
         }
     }
 
@@ -606,7 +660,8 @@ mod tests {
         }
 
         fn read(&self, path: &RemotePath, offset: u64, size: u32) -> Result<Vec<u8>> {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            state.read_calls += 1;
             let (_, contents) = state.nodes.get(path.as_str()).ok_or(Error::NotFound)?;
             let contents = contents
                 .as_ref()
@@ -724,13 +779,23 @@ mod tests {
     // A generous TTL so caching is active and invalidation logic is exercised.
     const LONG_TTL: Duration = Duration::from_secs(3600);
 
+    /// A cache dir that is never actually written to (Remote-mode helpers below
+    /// don't hydrate content, and metadata-only tests never touch disk).
+    fn unused_cache_dir() -> PathBuf {
+        std::env::temp_dir().join("cacheshfs-tests-unused")
+    }
+
+    // These general helpers use `Remote` mode so reads pass through the mock
+    // (no on-disk content cache), while metadata caching stays active. Content
+    // caching has its own helper (`content_vfs`) with a real temp dir.
     fn vfs() -> CacheVfs {
         CacheVfs::new(
             Arc::new(MockRemote::new()),
             RemotePath::root(),
             false,
-            CacheMode::OnDemand,
+            CacheMode::Remote,
             LONG_TTL,
+            unused_cache_dir(),
         )
     }
 
@@ -739,16 +804,55 @@ mod tests {
             Arc::new(MockRemote::new()),
             RemotePath::root(),
             true,
-            CacheMode::OnDemand,
+            CacheMode::Remote,
             LONG_TTL,
+            unused_cache_dir(),
         )
     }
 
     /// A VFS plus a handle to its mock remote, for asserting on call counts.
     fn vfs_with(mode: CacheMode, ttl: Duration) -> (CacheVfs, Arc<MockRemote>) {
         let remote = Arc::new(MockRemote::new());
-        let vfs = CacheVfs::new(remote.clone(), RemotePath::root(), false, mode, ttl);
+        let vfs = CacheVfs::new(
+            remote.clone(),
+            RemotePath::root(),
+            false,
+            mode,
+            ttl,
+            unused_cache_dir(),
+        );
         (vfs, remote)
+    }
+
+    /// A content-caching VFS backed by a real temp cache dir, plus the mock
+    /// remote and the `TempDir` guard (held so the dir isn't cleaned up).
+    fn content_vfs(mode: CacheMode, ttl: Duration) -> (CacheVfs, Arc<MockRemote>, tempfile::TempDir) {
+        let remote = Arc::new(MockRemote::new());
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = CacheVfs::new(
+            remote.clone(),
+            RemotePath::root(),
+            false,
+            mode,
+            ttl,
+            dir.path().to_path_buf(),
+        );
+        (vfs, remote, dir)
+    }
+
+    /// Open `name` under the root for reading and return (node, handle).
+    fn open_for_read(vfs: &CacheVfs, name: &str) -> (NodeId, FileHandle) {
+        let node = vfs.lookup(NodeId::ROOT, name).unwrap().node;
+        let handle = vfs
+            .open(
+                node,
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (node, handle)
     }
 
     #[test]
@@ -1223,5 +1327,70 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "moved.txt"));
         assert!(!names.iter().any(|n| n == "readme.txt"));
+    }
+
+    #[test]
+    fn read_hydrates_then_serves_from_cache() {
+        let (vfs, remote, dir) = content_vfs(CacheMode::OnDemand, LONG_TTL);
+        let (node, handle) = open_for_read(&vfs, "readme.txt");
+
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+        // The whole file was hydrated to an on-disk object.
+        assert!(crate::content_cache::object_exists(dir.path(), node));
+
+        let reads = remote.read_calls();
+        // Further reads (including partial ones) are served locally.
+        assert_eq!(vfs.read(handle, 0, 2).unwrap(), b"he");
+        assert_eq!(vfs.read(handle, 1, 3).unwrap(), b"ell");
+        assert_eq!(
+            remote.read_calls(),
+            reads,
+            "cached reads must not hit the remote"
+        );
+    }
+
+    #[test]
+    fn write_evicts_cached_content_and_next_read_rehydrates() {
+        let (vfs, _remote, _dir) = content_vfs(CacheMode::OnDemand, LONG_TTL);
+        let node = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
+        let handle = vfs
+            .open(
+                node,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+        vfs.write(handle, 0, b"J").unwrap(); // -> "Jello"; evicts cached content
+        // The next read re-hydrates from the remote, which now has the new data.
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"Jello");
+    }
+
+    #[test]
+    fn remote_mode_does_not_cache_content() {
+        let (vfs, _remote, dir) = content_vfs(CacheMode::Remote, LONG_TTL);
+        let (node, handle) = open_for_read(&vfs, "readme.txt");
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+        assert!(
+            !crate::content_cache::object_exists(dir.path(), node),
+            "remote mode reads straight through and must not hydrate"
+        );
+    }
+
+    #[test]
+    fn stale_content_is_rehydrated_after_external_change() {
+        // A zero TTL makes getattr always observe fresh metadata, so the content
+        // cache can detect the change and re-hydrate.
+        let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
+        let (_node, handle) = open_for_read(&vfs, "readme.txt");
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"hello");
+
+        // Something else changes the file on the remote (new size + mtime).
+        remote.set_file("/readme.txt", b"goodbye!");
+        assert_eq!(vfs.read(handle, 0, 1024).unwrap(), b"goodbye!");
     }
 }

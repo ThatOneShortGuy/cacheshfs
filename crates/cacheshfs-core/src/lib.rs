@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod content_cache;
 mod vfs;
 
 pub use vfs::CacheVfs;
