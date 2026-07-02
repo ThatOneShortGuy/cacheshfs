@@ -89,7 +89,7 @@ impl FileSystemContext for CacheFs {
         _security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> FspResult<FileSecurity> {
-        let metadata = resolve(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
+        let (metadata, _) = resolve(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
         Ok(FileSecurity {
             reparse: false,
             // We don't supply ACLs (persistent_acls is disabled); WinFsp uses a
@@ -106,7 +106,7 @@ impl FileSystemContext for CacheFs {
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> FspResult<Self::FileContext> {
-        let metadata = resolve(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
+        let (metadata, canonical) = resolve(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
         let is_dir = matches!(metadata.attributes.kind, FileKind::Directory);
 
         let handle = if is_dir {
@@ -117,11 +117,13 @@ impl FileSystemContext for CacheFs {
         };
 
         fill_file_info(&metadata.attributes, metadata.node.0, file_info.as_mut());
-        // Tell WinFsp the file's real (case-preserved) name. Without this, a
+        // Report the canonical (real-case) name to WinFsp. Without this, a
         // case-insensitive volume upper-cases the name for later operations
         // (e.g. cleanup/delete), which then fails against the case-sensitive
-        // remote.
-        file_info.set_normalized_name(file_name.as_slice(), None);
+        // remote; and an open by a differently-cased name would show the wrong
+        // case. `canonical` is the case as it actually exists on the remote.
+        let normalized: Vec<u16> = canonical.encode_utf16().collect();
+        file_info.set_normalized_name(&normalized, None);
         Ok(CacheFile {
             node: metadata.node,
             handle,
