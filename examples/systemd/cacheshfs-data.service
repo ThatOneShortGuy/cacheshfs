@@ -1,0 +1,34 @@
+# Example systemd unit for mounting a remote directory with cacheshfs at boot.
+#
+# cacheshfs runs in the foreground for the life of the mount, so a plain
+# Type=simple service is the natural fit (fstab is not — see the README).
+#
+# Install:
+#   sudo cp cacheshfs-data.service /etc/systemd/system/
+#   # edit the User, paths, and remote target below to match your setup
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cacheshfs-data.service
+#
+# Before enabling, make sure the remote host key is already in the service
+# user's ~/.ssh/known_hosts (otherwise the trust-on-first-use prompt blocks
+# forever at boot with no TTY), and that the SSH key needs no passphrase.
+
+[Unit]
+Description=cacheshfs mount of example.com:/srv/data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the user whose ~/.ssh config and keys should be used.
+User=alice
+Group=alice
+# FUSE requires the mountpoint to exist as a directory before mounting.
+ExecStartPre=/bin/mkdir -p /mnt/data
+ExecStart=/usr/local/bin/cacheshfs alice@example.com:/srv/data /mnt/data --cache-mode on-demand
+ExecStop=/bin/fusermount -u /mnt/data
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

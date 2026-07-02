@@ -121,6 +121,65 @@ fusermount -uz <mountpoint>     # lazy unmount if it says "target is busy"
 Then the mountpoint is a normal empty directory again and `rmdir <mountpoint>`
 works.
 
+## Automounting on Linux at boot
+
+Use a **systemd service**, not `/etc/fstab`. cacheshfs runs in the foreground
+for the whole life of the mount (it does not daemonize), which is exactly what a
+`Type=simple` unit expects. fstab-style FUSE entries rely on a `mount.<fstype>`
+helper that follows the `mount` calling convention (the way `sshfs` does);
+cacheshfs has its own `<[user@]host:/path> <mountpoint>` CLI and ships no such
+helper, so `mount`/fstab cannot invoke it.
+
+A ready-to-edit unit is in
+[`examples/systemd/cacheshfs-data.service`](examples/systemd/cacheshfs-data.service):
+
+```ini
+[Unit]
+Description=cacheshfs mount of example.com:/srv/data
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alice
+Group=alice
+ExecStartPre=/bin/mkdir -p /mnt/data
+ExecStart=/usr/local/bin/cacheshfs alice@example.com:/srv/data /mnt/data --cache-mode on-demand
+ExecStop=/bin/fusermount -u /mnt/data
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo cp examples/systemd/cacheshfs-data.service /etc/systemd/system/
+# edit the User, paths, and remote target to match your setup
+sudo systemctl daemon-reload
+sudo systemctl enable --now cacheshfs-data.service
+```
+
+A few things matter specifically because this runs at boot with no terminal:
+
+- **Pre-seed the host key.** An unknown host key triggers an interactive
+  trust-on-first-use prompt, which would hang forever with no TTY. Add the
+  remote's key to the service user's `~/.ssh/known_hosts` first, or pass
+  `--accept-unknown-host-key` (insecure: skips verification).
+- **Use a passphrase-less key.** Run the service as a real user (`User=alice`)
+  so `~/.ssh/config` and key files resolve, and use a key that needs no
+  passphrase (or one held by an agent) — there is nothing to prompt at boot.
+  `--identity-file` pins a specific key.
+- **Only the mounting user sees the mount.** `--allow-other` is not yet applied,
+  so the mountpoint is accessible only to the service user, not other users or
+  root.
+- **Offline mounts need no network.** With `--cache-mode offline`, drop the
+  `network-online.target` lines — it serves entirely from the cache and never
+  connects.
+- **Keep the cache outside the mountpoint** (this is enforced). The per-user
+  default (`~/.cache/cacheshfs`) is fine, or set `--cache-dir` to something like
+  `/var/cache/cacheshfs` owned by the service user.
+
 ## Workspace layout
 
 | Crate | Role |
