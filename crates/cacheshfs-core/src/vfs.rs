@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::store::Store;
 use crate::{
-    CacheMode, CreatedFile, DirectoryEntry, Error, FileAttributes, FileHandle, FileMetadata, NodeId,
-    OpenFlags, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result, SetAttributes,
+    CacheMode, CreatedFile, DirectoryEntry, Error, FileAttributes, FileHandle, FileMetadata,
+    NodeId, OpenFlags, RemoteDirectoryEntry, RemoteFilesystem, RemotePath, Result, SetAttributes,
     VirtualFilesystem,
 };
 
@@ -369,9 +369,7 @@ impl VirtualFilesystem for CacheVfs {
             // previously seen files keep working offline. Server-wins still
             // applies whenever the server is actually reachable.
             Err(error) => match self.store.get_attrs(&path) {
-                Some(attributes) if is_unreachable(&error) => {
-                    Ok(FileMetadata { node, attributes })
-                }
+                Some(attributes) if is_unreachable(&error) => Ok(FileMetadata { node, attributes }),
                 _ => Err(error),
             },
         }
@@ -976,7 +974,10 @@ mod tests {
 
     /// A content-caching VFS backed by a real temp cache dir, plus the mock
     /// remote and the `TempDir` guard (held so the dir isn't cleaned up).
-    fn content_vfs(mode: CacheMode, ttl: Duration) -> (CacheVfs, Arc<MockRemote>, tempfile::TempDir) {
+    fn content_vfs(
+        mode: CacheMode,
+        ttl: Duration,
+    ) -> (CacheVfs, Arc<MockRemote>, tempfile::TempDir) {
         let remote = Arc::new(MockRemote::new());
         let dir = tempfile::tempdir().unwrap();
         let vfs = CacheVfs::new(
@@ -1361,7 +1362,11 @@ mod tests {
         let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
         vfs.getattr(NodeId::ROOT).unwrap();
         vfs.getattr(NodeId::ROOT).unwrap();
-        assert_eq!(remote.stat_calls(), 1, "second getattr should be a cache hit");
+        assert_eq!(
+            remote.stat_calls(),
+            1,
+            "second getattr should be a cache hit"
+        );
     }
 
     #[test]
@@ -1372,7 +1377,13 @@ mod tests {
         let before = remote.stat_calls();
 
         let handle = vfs
-            .open(file, OpenFlags { write: true, ..Default::default() })
+            .open(
+                file,
+                OpenFlags {
+                    write: true,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         vfs.write(handle, 0, b"X").unwrap();
 
@@ -1389,10 +1400,18 @@ mod tests {
         let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
         vfs.readdir(NodeId::ROOT).unwrap();
         vfs.readdir(NodeId::ROOT).unwrap();
-        assert_eq!(remote.read_dir_calls(), 1, "second readdir should be cached");
+        assert_eq!(
+            remote.read_dir_calls(),
+            1,
+            "second readdir should be cached"
+        );
         // The listing primed the lookup/attr caches, so this needs no remote stat.
         vfs.lookup(NodeId::ROOT, "readme.txt").unwrap();
-        assert_eq!(remote.stat_calls(), 0, "lookup after readdir should be cached");
+        assert_eq!(
+            remote.stat_calls(),
+            0,
+            "lookup after readdir should be cached"
+        );
     }
 
     #[test]
@@ -1400,14 +1419,24 @@ mod tests {
         let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
         vfs.lookup(NodeId::ROOT, "readme.txt").unwrap();
         vfs.lookup(NodeId::ROOT, "readme.txt").unwrap();
-        assert_eq!(remote.stat_calls(), 1, "second lookup should be a cache hit");
+        assert_eq!(
+            remote.stat_calls(),
+            1,
+            "second lookup should be a cache hit"
+        );
     }
 
     #[test]
     fn negative_lookup_is_cached() {
         let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
-        assert!(matches!(vfs.lookup(NodeId::ROOT, "nope"), Err(Error::NotFound)));
-        assert!(matches!(vfs.lookup(NodeId::ROOT, "nope"), Err(Error::NotFound)));
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "nope"),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "nope"),
+            Err(Error::NotFound)
+        ));
         assert_eq!(remote.stat_calls(), 1, "negative result should be cached");
     }
 
@@ -1441,7 +1470,10 @@ mod tests {
             .unwrap();
         // The stale negative must not be served.
         assert_eq!(
-            vfs.lookup(NodeId::ROOT, "fresh.txt").unwrap().attributes.kind,
+            vfs.lookup(NodeId::ROOT, "fresh.txt")
+                .unwrap()
+                .attributes
+                .kind,
             FileKind::File
         );
         assert!(
@@ -1680,9 +1712,8 @@ mod tests {
     #[test]
     fn readdir_falls_back_to_cache_when_remote_unreachable() {
         let (vfs, remote, _dir) = content_vfs(CacheMode::OnDemand, Duration::ZERO);
-        let names = |entries: &[DirectoryEntry]| {
-            entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
-        };
+        let names =
+            |entries: &[DirectoryEntry]| entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
         let online = names(&vfs.readdir(NodeId::ROOT).unwrap());
 
         remote.set_unreachable(true);

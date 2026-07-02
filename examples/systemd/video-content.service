@@ -20,7 +20,7 @@ Wants=network-online.target
 Type=simple
 # FUSE requires the mountpoint to exist as a directory before mounting.
 ExecStartPre=/bin/mkdir -p %h/video-content
-ExecStart=/home/braxton/cacheshfs/target/release/cacheshfs --read-only --cache-mode on-demand worker@thebrown.us:/mnt/video-content %h/video-content
+ExecStart=/home/braxton/cacheshfs/target/release/cacheshfs --read-only --cache-mode on-demand --cache-chunk-size 1M --remote-read-timeout 5s worker@thebrown.us:/mnt/video-content %h/video-content
 ExecStop=/bin/fusermount -u %h/video-content
 Restart=on-failure
 RestartSec=5

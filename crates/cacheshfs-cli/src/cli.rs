@@ -145,10 +145,7 @@ impl Cli {
     /// Build a [`MountConfig`] from the parsed arguments.
     pub fn to_mount_config(&self) -> Result<MountConfig, String> {
         let remote = parse_remote(&self.remote)?;
-        let cache_dir = self
-            .cache_dir
-            .clone()
-            .unwrap_or_else(default_cache_dir);
+        let cache_dir = self.cache_dir.clone().unwrap_or_else(default_cache_dir);
 
         // Safety requirement: the cache directory must never live inside the
         // mounted filesystem tree, or cache writes would recurse through the
@@ -305,7 +302,9 @@ pub fn parse_remote(spec: &str) -> Result<RemoteConfig, String> {
         return Err(format!("invalid remote '{spec}': missing host before ':'"));
     }
     if root.is_empty() {
-        return Err(format!("invalid remote '{spec}': missing remote path after ':'"));
+        return Err(format!(
+            "invalid remote '{spec}': missing remote path after ':'"
+        ));
     }
 
     Ok(RemoteConfig {
@@ -578,9 +577,15 @@ mod parse_tests {
         let bare = parse(&["cacheshfs", "host:/srv", "/mnt"]).unwrap();
         assert!(bare.unwired_options().is_empty());
 
-        let with_extras =
-            parse(&["cacheshfs", "host:/srv", "/mnt", "--download", "/d", "--allow-other"])
-                .unwrap();
+        let with_extras = parse(&[
+            "cacheshfs",
+            "host:/srv",
+            "/mnt",
+            "--download",
+            "/d",
+            "--allow-other",
+        ])
+        .unwrap();
         let reported = with_extras.unwired_options();
         assert!(reported.contains(&"--download"));
         assert!(reported.contains(&"--allow-other"));
@@ -636,7 +641,11 @@ mod parse_tests {
         assert_eq!(options.target.username, "alice");
         assert_eq!(options.target.host, "host");
         assert_eq!(options.target.port, 2222);
-        assert!(options.identity_files.contains(&PathBuf::from("/keys/id_ed25519")));
+        assert!(
+            options
+                .identity_files
+                .contains(&PathBuf::from("/keys/id_ed25519"))
+        );
         // Secure default: unknown host keys are rejected unless opted in.
         assert!(!options.accept_unknown_hosts);
     }
@@ -667,9 +676,11 @@ mod parse_tests {
         assert_eq!(options.target.host, "home.example.com");
         assert_eq!(options.target.username, "braxton");
         assert_eq!(options.target.port, 2222);
-        assert!(options
-            .identity_files
-            .contains(&PathBuf::from("/keys/server_ed25519")));
+        assert!(
+            options
+                .identity_files
+                .contains(&PathBuf::from("/keys/server_ed25519"))
+        );
     }
 
     #[test]
@@ -745,14 +756,8 @@ mod parse_tests {
             ("4MiB", 4 * 1024 * 1024),
             ("1G", 1024 * 1024 * 1024),
         ] {
-            let cli = parse(&[
-                "cacheshfs",
-                "host:/srv",
-                "/mnt",
-                "--cache-chunk-size",
-                text,
-            ])
-            .unwrap();
+            let cli =
+                parse(&["cacheshfs", "host:/srv", "/mnt", "--cache-chunk-size", text]).unwrap();
             assert_eq!(cli.to_mount_config().unwrap().cache_chunk_size, expected);
         }
     }
@@ -760,13 +765,7 @@ mod parse_tests {
     #[test]
     fn cache_chunk_size_rejects_invalid_values() {
         for text in ["0", "", "abc", "4XB"] {
-            let cli = parse(&[
-                "cacheshfs",
-                "host:/srv",
-                "/mnt",
-                "--cache-chunk-size",
-                text,
-            ]);
+            let cli = parse(&["cacheshfs", "host:/srv", "/mnt", "--cache-chunk-size", text]);
             if let Ok(cli) = cli {
                 assert!(cli.to_mount_config().is_err(), "value {text} should fail");
             }

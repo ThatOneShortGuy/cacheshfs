@@ -38,10 +38,7 @@ fn invalid_remote_fails_with_message() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid remote"),
-        "stderr was: {stderr}"
-    );
+    assert!(stderr.contains("invalid remote"), "stderr was: {stderr}");
 }
 
 #[test]

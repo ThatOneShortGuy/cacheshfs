@@ -76,7 +76,10 @@ pub fn resolve(vfs: &dyn VirtualFilesystem, file_name: &U16CStr) -> Result<(File
 /// given (callers use it either for a new name in `create` or, for operations
 /// on an existing file, receive an already case-corrected normalized name from
 /// WinFsp). Returns [`Error::InvalidInput`] for the root, which has no parent.
-pub fn resolve_parent(vfs: &dyn VirtualFilesystem, file_name: &U16CStr) -> Result<(NodeId, String)> {
+pub fn resolve_parent(
+    vfs: &dyn VirtualFilesystem,
+    file_name: &U16CStr,
+) -> Result<(NodeId, String)> {
     let components = components(file_name);
     let (leaf, parents) = components
         .split_last()
@@ -200,7 +203,10 @@ mod tests {
             NodeId(2)
         );
         assert_eq!(
-            resolve(&vfs, w("\\dir\\file.txt").as_ucstr()).unwrap().0.node,
+            resolve(&vfs, w("\\dir\\file.txt").as_ucstr())
+                .unwrap()
+                .0
+                .node,
             NodeId(3)
         );
     }

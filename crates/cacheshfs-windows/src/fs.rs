@@ -9,15 +9,17 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cacheshfs_core::{Error, FileHandle, FileKind, NodeId, OpenFlags, SetAttributes, VirtualFilesystem};
+use cacheshfs_core::{
+    Error, FileHandle, FileKind, NodeId, OpenFlags, SetAttributes, VirtualFilesystem,
+};
+use winfsp::Result as FspResult;
 use winfsp::U16CStr;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
 };
-use winfsp::Result as FspResult;
 
-use crate::attr::{fill_file_info, windows_file_attributes, FILE_ATTRIBUTE_READONLY};
+use crate::attr::{FILE_ATTRIBUTE_READONLY, fill_file_info, windows_file_attributes};
 use crate::error::to_fsp;
 use crate::path::{resolve, resolve_parent};
 
@@ -57,8 +59,7 @@ pub struct CacheFile {
 
 /// Derive shared-core open flags from WinFsp's create options / granted access.
 fn open_flags(_create_options: u32, granted_access: u32) -> OpenFlags {
-    let write =
-        granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES) != 0;
+    let write = granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES) != 0;
     OpenFlags {
         read: true,
         write,
@@ -303,7 +304,8 @@ impl FileSystemContext for CacheFs {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> FspResult<()> {
-        let (old_parent, old_name) = resolve_parent(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
+        let (old_parent, old_name) =
+            resolve_parent(self.vfs.as_ref(), file_name).map_err(to_fsp)?;
         let (new_parent, new_name) =
             resolve_parent(self.vfs.as_ref(), new_file_name).map_err(to_fsp)?;
         self.vfs
@@ -326,8 +328,7 @@ impl FileSystemContext for CacheFs {
         // WinFsp passes 0 for "leave unchanged"; INVALID_FILE_ATTRIBUTES
         // (0xFFFFFFFF) likewise means no change for the attribute mask.
         if last_write_time != 0 {
-            attributes.modified_unix_seconds =
-                Some(crate::attr::filetime_to_unix(last_write_time));
+            attributes.modified_unix_seconds = Some(crate::attr::filetime_to_unix(last_write_time));
         }
         if last_access_time != 0 {
             attributes.accessed_unix_seconds =
@@ -384,12 +385,7 @@ impl FileSystemContext for CacheFs {
         Ok(())
     }
 
-    fn read(
-        &self,
-        context: &Self::FileContext,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> FspResult<u32> {
+    fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> FspResult<u32> {
         let handle = context
             .handle
             .ok_or_else(|| to_fsp(Error::InvalidInput("read on a directory".to_string())))?;
@@ -418,7 +414,12 @@ impl FileSystemContext for CacheFs {
         // `write_to_eof` (append) and `constrained_io` (don't extend the file)
         // both need the current size.
         let (offset, data): (u64, &[u8]) = if write_to_eof || constrained_io {
-            let size = self.vfs.getattr(context.node).map_err(to_fsp)?.attributes.size;
+            let size = self
+                .vfs
+                .getattr(context.node)
+                .map_err(to_fsp)?
+                .attributes
+                .size;
             let offset = if write_to_eof { size } else { offset };
             if constrained_io {
                 if offset >= size {

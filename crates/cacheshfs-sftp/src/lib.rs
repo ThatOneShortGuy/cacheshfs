@@ -21,7 +21,9 @@ use russh::client::{self, Handle};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::known_hosts::{learn_known_hosts, learn_known_hosts_path};
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key};
+use russh::keys::{
+    HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts_path, load_secret_key,
+};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes as SftpAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -179,7 +181,10 @@ impl RemoteFilesystem for SftpBackend {
                 let mut buffer = vec![0u8; size as usize];
                 let mut filled = 0;
                 while filled < buffer.len() {
-                    let read = file.read(&mut buffer[filled..]).await.map_err(map_io_error)?;
+                    let read = file
+                        .read(&mut buffer[filled..])
+                        .await
+                        .map_err(map_io_error)?;
                     if read == 0 {
                         break;
                     }
@@ -468,7 +473,10 @@ async fn connect_async(
     Ok((handle, sftp))
 }
 
-async fn authenticate(handle: &mut Handle<ClientHandler>, options: &SftpConnectOptions) -> Result<()> {
+async fn authenticate(
+    handle: &mut Handle<ClientHandler>,
+    options: &SftpConnectOptions,
+) -> Result<()> {
     // The hash algorithm only matters for RSA keys; ed25519/ecdsa ignore it.
     let rsa_hash = handle
         .best_supported_rsa_hash()
@@ -494,7 +502,10 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, options: &SftpConnectO
         };
 
         let key = PrivateKeyWithHashAlg::new(key, rsa_hash);
-        match handle.authenticate_publickey(&options.target.username, key).await {
+        match handle
+            .authenticate_publickey(&options.target.username, key)
+            .await
+        {
             Ok(result) if result.success() => return Ok(()),
             _ => continue,
         }

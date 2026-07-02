@@ -367,7 +367,8 @@ impl Store {
             .get(path.as_str())
             .and_then(|entry| entry.content.as_ref())
             .filter(|content| {
-                content.size == attrs.size && content.modified == attrs.modified_unix_seconds
+                content.size == attrs.size
+                    && content.modified == attrs.modified_unix_seconds
                     && content.chunk_size == self.chunk_size
             })
             .and_then(|content| content.chunks.get(&chunk).copied())

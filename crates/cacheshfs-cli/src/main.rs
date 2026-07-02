@@ -30,9 +30,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let config = cli.to_mount_config()?;
 
     for option in cli.unwired_options() {
-        eprintln!(
-            "cacheshfs: warning: {option} is accepted but not yet applied in this build"
-        );
+        eprintln!("cacheshfs: warning: {option} is accepted but not yet applied in this build");
     }
 
     // Validate the remote root and cache settings before opening a connection.

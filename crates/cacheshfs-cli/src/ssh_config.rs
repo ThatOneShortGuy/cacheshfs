@@ -189,7 +189,10 @@ Host server
         assert_eq!(resolved.hostname.as_deref(), Some("home.example.com"));
         assert_eq!(resolved.user.as_deref(), Some("braxton"));
         assert_eq!(resolved.port, Some(2222));
-        assert_eq!(resolved.identity_files, vec![PathBuf::from("/keys/id_ed25519")]);
+        assert_eq!(
+            resolved.identity_files,
+            vec![PathBuf::from("/keys/id_ed25519")]
+        );
     }
 
     #[test]
@@ -217,7 +220,10 @@ Host *
     #[test]
     fn wildcard_and_question_patterns_match() {
         let config = "Host *.example.com\n    User web\nHost db?\n    User dba\n";
-        assert_eq!(resolve(config, "api.example.com").user.as_deref(), Some("web"));
+        assert_eq!(
+            resolve(config, "api.example.com").user.as_deref(),
+            Some("web")
+        );
         assert_eq!(resolve(config, "db1").user.as_deref(), Some("dba"));
         assert!(resolve(config, "db12").user.is_none());
     }
