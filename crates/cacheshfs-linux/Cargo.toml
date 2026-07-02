@@ -5,5 +5,10 @@ edition.workspace = true
 
 [dependencies]
 cacheshfs-core.workspace = true
+
+# FUSE bindings only build on Linux (fuser's build script needs libfuse /
+# pkg-config). Gating them here keeps the crate an empty stub on other
+# platforms so the whole workspace builds — and `cargo run` works — everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
 fuser.workspace = true
 libc.workspace = true
