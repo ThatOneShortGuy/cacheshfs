@@ -1137,4 +1137,91 @@ mod tests {
         assert_eq!(remote.stat_calls(), 0);
         assert_eq!(remote.read_dir_calls(), 0);
     }
+
+    #[test]
+    fn create_clears_a_cached_negative_lookup() {
+        let vfs = vfs();
+        // Cache a negative result, then create the same name.
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "fresh.txt"),
+            Err(Error::NotFound)
+        ));
+        vfs.create(NodeId::ROOT, "fresh.txt", 0o644, OpenFlags::default())
+            .unwrap();
+        // The stale negative must not be served.
+        assert_eq!(
+            vfs.lookup(NodeId::ROOT, "fresh.txt").unwrap().attributes.kind,
+            FileKind::File
+        );
+        assert!(
+            vfs.readdir(NodeId::ROOT)
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "fresh.txt")
+        );
+    }
+
+    #[test]
+    fn unlink_negatively_caches_without_further_remote_calls() {
+        let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
+        vfs.lookup(NodeId::ROOT, "readme.txt").unwrap();
+        vfs.unlink(NodeId::ROOT, "readme.txt").unwrap();
+        let calls = remote.stat_calls();
+
+        // The unlinked name is now cached-negative: NotFound with no extra stat.
+        assert!(matches!(
+            vfs.lookup(NodeId::ROOT, "readme.txt"),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(remote.stat_calls(), calls);
+    }
+
+    #[test]
+    fn readdir_reflects_create_and_unlink() {
+        let vfs = vfs();
+        let before = vfs.readdir(NodeId::ROOT).unwrap().len();
+
+        vfs.create(NodeId::ROOT, "extra.txt", 0o644, OpenFlags::default())
+            .unwrap();
+        assert_eq!(vfs.readdir(NodeId::ROOT).unwrap().len(), before + 1);
+
+        vfs.unlink(NodeId::ROOT, "extra.txt").unwrap();
+        assert_eq!(vfs.readdir(NodeId::ROOT).unwrap().len(), before);
+    }
+
+    #[test]
+    fn setattr_refreshes_cache_without_a_restat() {
+        let (vfs, remote) = vfs_with(CacheMode::OnDemand, LONG_TTL);
+        let file = vfs.lookup(NodeId::ROOT, "readme.txt").unwrap().node;
+        vfs.setattr(
+            file,
+            SetAttributes {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = remote.stat_calls();
+
+        // setattr caches the server's returned attributes, so getattr is a hit.
+        assert_eq!(vfs.getattr(file).unwrap().attributes.mode, 0o600);
+        assert_eq!(remote.stat_calls(), calls);
+    }
+
+    #[test]
+    fn rename_updates_both_directory_listings() {
+        let vfs = vfs();
+        vfs.readdir(NodeId::ROOT).unwrap(); // prime the listing cache
+        vfs.rename(NodeId::ROOT, "readme.txt", NodeId::ROOT, "moved.txt")
+            .unwrap();
+
+        let names: Vec<_> = vfs
+            .readdir(NodeId::ROOT)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "moved.txt"));
+        assert!(!names.iter().any(|n| n == "readme.txt"));
+    }
 }

@@ -523,4 +523,43 @@ mod parse_tests {
         assert_eq!(config.cache_dir, PathBuf::from("/var/cache/cacheshfs"));
         assert!(!config.read_only);
     }
+
+    #[test]
+    fn parse_duration_accepts_units_and_bare_seconds() {
+        use super::parse_duration;
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        // A bare number is seconds; surrounding whitespace is ignored.
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+        assert_eq!(parse_duration("  10s ").unwrap(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        use super::parse_duration;
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("s").is_err()); // unit with no number
+        assert!(parse_duration("10x").is_err()); // unknown unit
+    }
+
+    #[test]
+    fn metadata_ttl_defaults_and_parses() {
+        let default = parse(&["cacheshfs", "host:/srv", "/mnt"]).unwrap();
+        assert_eq!(
+            default.metadata_ttl_duration().unwrap(),
+            Duration::from_secs(5)
+        );
+
+        let custom = parse(&["cacheshfs", "host:/srv", "/mnt", "--metadata-ttl", "2m"]).unwrap();
+        assert_eq!(
+            custom.metadata_ttl_duration().unwrap(),
+            Duration::from_secs(120)
+        );
+
+        let bad = parse(&["cacheshfs", "host:/srv", "/mnt", "--metadata-ttl", "nope"]).unwrap();
+        assert!(bad.metadata_ttl_duration().is_err());
+    }
 }
