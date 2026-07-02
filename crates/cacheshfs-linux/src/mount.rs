@@ -5,6 +5,31 @@ use fuser::{Config, MountOption};
 use std::sync::Arc;
 
 pub fn mount(config: MountConfig, filesystem: Arc<dyn VirtualFilesystem>) -> Result<()> {
+    // FUSE requires the mountpoint to already exist as a directory. Check it up
+    // front so the failure is a clear message rather than a bare ENOENT from the
+    // mount syscall.
+    match std::fs::metadata(&config.mountpoint) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(Error::InvalidInput(format!(
+                "mountpoint '{}' is not a directory",
+                config.mountpoint.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::InvalidInput(format!(
+                "mountpoint '{0}' does not exist; create it first (e.g. `mkdir -p {0}`)",
+                config.mountpoint.display()
+            )));
+        }
+        Err(error) => {
+            return Err(Error::MountBackend(format!(
+                "cannot access mountpoint '{}': {error}",
+                config.mountpoint.display()
+            )));
+        }
+    }
+
     let mut mount_options = vec![
         MountOption::FSName("cacheshfs".to_string()),
         MountOption::Subtype("cacheshfs".to_string()),
